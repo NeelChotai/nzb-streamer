@@ -1,0 +1,69 @@
+[package]
+name = "nzb-streamer"
+version = "0.1.0"
+edition = "2021"
+authors = ["NZB Streamer Contributors"]
+description = "Stream video files from Usenet NZBs without full download"
+license = "MIT"
+
+[dependencies]
+# Web framework
+axum = { version = "0.6", features = ["macros", "multipart"] }
+tower = { version = "0.4" }
+tower-http = { version = "0.4", features = ["cors", "trace", "fs"] }
+
+# Async runtime
+tokio = { version = "1.28", features = ["full"] }
+tokio-util = { version = "0.7.8", features = ["codec"] }
+futures = "0.3"
+
+# Networking
+tokio-native-tls = "0.3"
+native-tls = "0.2.11"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+quick-xml = { version = "0.31", features = ["serialize"] }
+
+# Utilities
+bytes = "1"
+uuid = { version = "1", features = ["v4", "serde"] }
+lru = "0.12"
+anyhow = "1"
+thiserror = "1"
+base64 = "0.21"
+hex = "0.4"
+
+# HTTP utilities
+http = "1"
+http-range-header = "0.4"
+mime_guess = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Environment
+dotenvy = "0.15"
+
+# Date/Time
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tempfile = "3"
+mockito = "1"
+criterion = "0.5"
+pretty_assertions = "1"
+
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[profile.dev]
+opt-level = 0
+
+[profile.test]
+opt-level = 0
