@@ -1,9 +1,5 @@
 pub mod client;
-pub mod connection;
-pub mod pool;
-pub mod types;
-pub mod yenc;
+pub mod error;
+pub mod config;
 
 pub use client::NntpClient;
-pub use types::*;
-pub use yenc::{YencDecoder, YencInfo};
