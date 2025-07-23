@@ -7,53 +7,76 @@ description = "Stream video files from Usenet NZBs without full download"
 license = "MIT"
 
 [dependencies]
-# Web framework
-axum = { version = "0.6", features = ["macros", "multipart"] }
-tower = { version = "0.4" }
-tower-http = { version = "0.4", features = ["cors", "trace", "fs"] }
+axum = { version = "0.8", features = ["macros", "multipart"] }
+tower = { version = "0.5" }
+tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
-# Async runtime
-tokio = { version = "1.28", features = ["full"] }
-tokio-util = { version = "0.7.8", features = ["codec"] }
+tokio = { version = "1.46", features = ["full"] }
+tokio-util = { version = "0.7.15", features = ["codec"] }
 futures = "0.3"
 
-# Networking
 tokio-native-tls = "0.3"
-native-tls = "0.2.11"
+native-tls = "0.2.14"
 
-# Serialization
+rek2_nntp = "1.0.6"
+yenc = "0.2"
+
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-quick-xml = { version = "0.31", features = ["serialize"] }
 
-# Utilities
+# Binary parsing - Modern crates for PAR2 parsing (NUKED and rebuilt)
+binrw = { version = "0.15", features = ["std"] }
+deku = "0.19"
+zerocopy = { version = "0.8", features = ["derive"] }
+nom = "8"
+bytemuck = { version = "1.23", features = ["derive"] }
+scroll = { version = "0.13", features = ["derive"] }
+
+# Reed-Solomon error correction for PAR2 functionality  
+reed-solomon-erasure = "6.0"
+reed-solomon = "0.2.1"
+
 bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-lru = "0.12"
 anyhow = "1"
-thiserror = "1"
-base64 = "0.21"
+thiserror = "2"
+base64 = "0.22"
 hex = "0.4"
 
-# HTTP utilities
+# Virtual File System - Using proper async VFS abstractions with async feature
+vfs = { version = "0.12", features = ["async-vfs"] }
+async-vfs = "0.56"
+async-trait = "0.1"
+tempfile = "3"
+
+moka = { version = "0.12", features = ["future"] }
+derive_more = { version = "2.0", features = ["full"] }
+smart-default = "0.7"
+derive_builder = "0.20"
+
 http = "1"
 http-range-header = "0.4"
 mime_guess = "2"
 
-# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
-# Environment
 dotenvy = "0.15"
 
-# Date/Time
 chrono = { version = "0.4", features = ["serde"] }
+
+unrar = "0.5.8"
+
+nzb-rs = "0.5.12"
+byteorder = "1.5.0"
+md-5 = "0.10.6"
+fuser = "0.15.1"
+libc = "0.2.174"
 
 [dev-dependencies]
 tempfile = "3"
 mockito = "1"
-criterion = "0.5"
+criterion = "0.6"
 pretty_assertions = "1"
 
 
