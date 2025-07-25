@@ -1,6 +1,6 @@
-pub mod parser;
+pub mod error;
 pub mod matcher;
-//pub mod deobfuscate;
 pub mod par2_crc32;
+pub mod parser;
 
-pub use parser::{FilePar2Info, parse_par2_file};
+pub use parser::{FilePar2Info, Par2Parser};
