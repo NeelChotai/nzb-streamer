@@ -3,8 +3,9 @@ use nzb_rs::File;
 use rek2_nntp::{authenticate, body};
 use tracing::debug;
 
+#[derive(Debug)]
 pub struct NntpClient {
-    config: NntpConfig
+    pub config: NntpConfig
 }
 
 impl NntpClient {

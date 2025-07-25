@@ -57,11 +57,41 @@ pub enum NzbStreamerError {
     #[error("Cache error: {0}")]
     Cache(String),
     
+    #[error("Streaming server error: {0}")]
+    StreamingServer(String),
+    
+    #[error("Stream not found: {stream_id}")]
+    StreamNotFound { stream_id: String },
+    
+    #[error("Download task failed: {task_id} - {reason}")]
+    DownloadTaskFailed { task_id: String, reason: String },
+    
+    #[error("Priority queue error: {0}")]
+    PriorityQueue(String),
+    
+    #[error("Segment not available: {segment_id}")]
+    SegmentNotAvailable { segment_id: String },
+    
+    #[error("Cache corruption detected: {0}")]
+    CacheCorruption(String),
+    
+    #[error("Concurrent access error: {0}")]
+    ConcurrentAccess(String),
+    
     #[error("Connection pool error: {0}")]
     ConnectionPool(String),
     
     #[error("Timeout error: {0}")]
     Timeout(String),
+    
+    #[error("Download pool error: {0}")]
+    PoolError(String),
+    
+    #[error("Download scheduler error: {0}")]
+    SchedulerError(String),
+    
+    #[error("NNTP error: {0}")]
+    NntpError(String),
 }
 
 pub type Result<T> = std::result::Result<T, NzbStreamerError>;
@@ -113,7 +143,9 @@ impl NzbStreamerError {
             NzbStreamerError::NntpConnection(_) |
             NzbStreamerError::Network(_) |
             NzbStreamerError::Timeout(_) |
-            NzbStreamerError::ConnectionPool(_)
+            NzbStreamerError::ConnectionPool(_) |
+            NzbStreamerError::PoolError(_) |
+            NzbStreamerError::NntpError(_)
         )
     }
     
@@ -127,7 +159,47 @@ impl NzbStreamerError {
         matches!(self, 
             NzbStreamerError::ArticleCorrupt { .. } |
             NzbStreamerError::YencValidation(_) |
-            NzbStreamerError::RarParsing(_)
+            NzbStreamerError::RarParsing(_) |
+            NzbStreamerError::CacheCorruption(_)
+        )
+    }
+    
+    /// Create a streaming server error from any error type
+    pub fn streaming_server<E: fmt::Display>(err: E) -> Self {
+        NzbStreamerError::StreamingServer(err.to_string())
+    }
+    
+    /// Create a cache error from any error type
+    pub fn cache<E: fmt::Display>(err: E) -> Self {
+        NzbStreamerError::Cache(err.to_string())
+    }
+    
+    /// Create a priority queue error from any error type
+    pub fn priority_queue<E: fmt::Display>(err: E) -> Self {
+        NzbStreamerError::PriorityQueue(err.to_string())
+    }
+    
+    /// Check if this error is related to streaming operations
+    pub fn is_streaming_error(&self) -> bool {
+        matches!(self,
+            NzbStreamerError::StreamingServer(_) |
+            NzbStreamerError::StreamNotFound { .. } |
+            NzbStreamerError::DownloadTaskFailed { .. } |
+            NzbStreamerError::PriorityQueue(_) |
+            NzbStreamerError::SegmentNotAvailable { .. } |
+            NzbStreamerError::CacheCorruption(_) |
+            NzbStreamerError::ConcurrentAccess(_)
+        )
+    }
+    
+    /// Check if this error indicates a missing resource
+    pub fn is_not_found(&self) -> bool {
+        matches!(self,
+            NzbStreamerError::ArticleNotFound(_) |
+            NzbStreamerError::SessionNotFound { .. } |
+            NzbStreamerError::StreamNotFound { .. } |
+            NzbStreamerError::SegmentNotAvailable { .. } |
+            NzbStreamerError::RarFileNotFound { .. }
         )
     }
 }
