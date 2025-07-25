@@ -5,6 +5,7 @@ edition = "2021"
 authors = ["NZB Streamer Contributors"]
 description = "Stream video files from Usenet NZBs without full download"
 license = "MIT"
+default-run = "nzb-streamer"
 
 [dependencies]
 axum = { version = "0.8", features = ["macros", "multipart"] }
@@ -13,6 +14,8 @@ tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
 tokio = { version = "1.46", features = ["full"] }
 tokio-util = { version = "0.7.15", features = ["codec"] }
+
+clap = { version = "4.0", features = ["derive"] }
 futures = "0.3"
 
 tokio-native-tls = "0.3"
@@ -23,6 +26,7 @@ yenc = "0.2"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+regex = "1"
 
 # Binary parsing - Modern crates for PAR2 parsing (NUKED and rebuilt)
 binrw = { version = "0.15", features = ["std"] }
@@ -73,11 +77,18 @@ md-5 = "0.10.6"
 fuser = "0.15.1"
 libc = "0.2.174"
 
+# MKV/EBML parsing and memory mapping
+# ebml-iterable = "0.6"  # Commented out due to API compatibility issues
+matroska = "0.16"
+memmap2 = "0.9"
+rangeset = "0.2"
+
 [dev-dependencies]
 tempfile = "3"
 mockito = "1"
 criterion = "0.6"
 pretty_assertions = "1"
+axum-test = "16"
 
 
 [profile.release]
@@ -90,3 +101,15 @@ opt-level = 0
 
 [profile.test]
 opt-level = 0
+
+[[bin]]
+name = "nzb-streamer"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_server"
+path = "src/bin/test_server.rs"
+
+[[bin]]
+name = "standalone_stremio"
+path = "standalone_stremio.rs"
