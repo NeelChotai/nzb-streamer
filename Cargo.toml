@@ -82,6 +82,8 @@ libc = "0.2.174"
 matroska = "0.16"
 memmap2 = "0.9"
 rangeset = "0.2"
+config = "0.15.13"
+backoff = { version = "0.4.0", features = ["tokio"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -105,11 +107,3 @@ opt-level = 0
 [[bin]]
 name = "nzb-streamer"
 path = "src/main.rs"
-
-[[bin]]
-name = "test_server"
-path = "src/bin/test_server.rs"
-
-[[bin]]
-name = "standalone_stremio"
-path = "standalone_stremio.rs"
