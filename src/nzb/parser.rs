@@ -1,16 +1,14 @@
-use crate::{error::NzbStreamerError, nzb::error::NzbError};
-use nzb_rs::{File, Nzb as RawNzb, ParseNzbError};
-use tracing::{debug, info, warn};
+use crate::nzb::error::NzbError;
+use nzb_rs::{File, Nzb as RawNzb};
+use tracing::{debug, info};
 
+#[derive(Debug)]
 pub struct Nzb {
     pub par2: Vec<File>,
     pub rar: Vec<File>,
     pub obfuscated: Vec<File>,
 }
 
-pub struct NzbParser;
-
-impl NzbParser {
     pub fn parse(content: &str) -> Result<Nzb, NzbError> {
         debug!("parsing nzb");
 
@@ -44,4 +42,3 @@ impl NzbParser {
 
         Ok(nzb)
     }
-}

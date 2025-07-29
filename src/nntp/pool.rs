@@ -1,11 +1,8 @@
 use crate::nntp::{config::NntpConfig, error::NntpError};
-use nzb_rs::{File, Segment};
-use rek2_nntp::{authenticate, body, AuthenticatedConnection};
-use std::collections::HashMap;
+use rek2_nntp::{authenticate, AuthenticatedConnection};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tokio::time::{sleep, Duration};
-use tracing::{debug, error, warn};
+use tracing::{debug, warn};
 
 pub struct ConnectionPool {
     config: NntpConfig,

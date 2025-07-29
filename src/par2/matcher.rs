@@ -1,6 +1,6 @@
 use md5::{Digest, Md5};
 use std::collections::HashMap;
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 
@@ -8,146 +8,194 @@ use crate::par2::parser::FilePar2Info;
 
 const SIXTEEN_KB: usize = 16384;
 
-pub struct Par2Matcher {
-    par2_file: PathBuf,
+/// Information about a file found in the directory
+#[derive(Debug, Clone)]
+pub struct FileMatch {
+    pub path: PathBuf,
+    pub hash16k: Vec<u8>,
+    pub size: u64,
+    pub expected_name: Option<String>,
 }
 
-impl Par2Matcher {
-    pub fn compute_hash16k(path: &Path) -> io::Result<Vec<u8>> {
-        let mut file = File::open(path)?;
-        let mut buffer = vec![0u8; SIXTEEN_KB];
+/// Result of matching files against PAR2 info
+#[derive(Debug)]
+pub struct MatchResult {
+    pub matched_files: Vec<FileMatch>,
+    pub missing_files: Vec<(String, Vec<u8>)>, // (filename, hash16k)
+}
 
-        let bytes_read = file.read(&mut buffer)?;
-        buffer.truncate(bytes_read);
+/// Compute MD5 hash of first 16KB of a file
+pub fn compute_hash16k(path: &Path) -> io::Result<Vec<u8>> {
+    let mut file = File::open(path)?;
+    let mut buffer = vec![0u8; SIXTEEN_KB];
 
-        let mut hasher = Md5::new();
-        hasher.update(&buffer);
-        Ok(hasher.finalize().to_vec())
-    }
+    let bytes_read = file.read(&mut buffer)?;
+    buffer.truncate(bytes_read);
 
-    pub fn match_files_to_par2(
-        directory: &Path,
-        par2_info: &HashMap<String, FilePar2Info>,
-    ) -> io::Result<HashMap<Vec<u8>, PathBuf>> {
-        let mut hash_to_path = HashMap::new();
-        let mut hash_to_expected_name: HashMap<Vec<u8>, String> = HashMap::new();
-        for (filename, info) in par2_info {
-            hash_to_expected_name.insert(info.hash16k.clone(), filename.clone());
+    let mut hasher = Md5::new();
+    hasher.update(&buffer);
+    Ok(hasher.finalize().to_vec())
+}
+
+/// Scan directory and compute hash16k for all non-PAR2 files
+pub fn scan_directory(directory: &Path) -> io::Result<Vec<(PathBuf, Vec<u8>, u64)>> {
+    let mut files = Vec::new();
+    
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        // Skip directories and PAR2 files
+        if path.is_dir() || path.extension().is_some_and(|ext| ext == "par2") {
+            continue;
         }
 
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let path = entry.path();
+        match compute_hash16k(&path) {
+            Ok(hash) => {
+                let size = entry.metadata()?.len();
+                files.push((path, hash, size));
+            }
+            Err(e) => eprintln!("Error reading {}: {}", path.display(), e),
+        }
+    }
+    
+    Ok(files)
+}
 
-            // Skip directories and PAR2 files
-            if path.is_dir() || path.extension().is_some_and(|ext| ext == "par2") {
+pub fn match_files_to_par2(
+    directory: &Path,
+    par2_info: &HashMap<String, FilePar2Info>,
+) -> io::Result<MatchResult> {
+    // Build lookup tables
+    let mut hash_to_expected: HashMap<Vec<u8>, (&str, u64)> = HashMap::new();
+    for (filename, info) in par2_info {
+        hash_to_expected.insert(info.hash16k.clone(), (filename.as_str(), info.filesize));
+    }
+    
+    // Scan directory once
+    let scanned_files = scan_directory(directory)?;
+    
+    // Match files
+    let mut matched_files = Vec::new();
+    let mut found_hashes = HashMap::new();
+    
+    for (path, hash, size) in scanned_files {
+        if let Some((expected_name, expected_size)) = hash_to_expected.get(&hash) {
+            let current_name = path.file_name().unwrap().to_string_lossy();
+            
+            // Verify size matches for extra validation
+            if size != *expected_size {
+                eprintln!(
+                    "Warning: {current_name} matches hash but size differs ({size}b vs {expected_size}b expected)"
+                );
                 continue;
             }
+            
+            found_hashes.insert(hash.clone(), ());
+            
+            let needs_rename = current_name != *expected_name;
+            if needs_rename {
+                println!("✓ {current_name} matches hash for '{expected_name}' (needs rename)");
+            } else {
+                println!("✓ {current_name} matches (correct name)");
+            }
+            
+            matched_files.push(FileMatch {
+                path,
+                hash16k: hash,
+                size,
+                expected_name: Some(expected_name.to_string()),
+            });
+        }
+    }
+    
+    // Find missing files
+    let missing_files: Vec<_> = par2_info
+        .iter()
+        .filter(|(_, info)| !found_hashes.contains_key(&info.hash16k))
+        .map(|(name, info)| {
+            println!("✗ {name} not found");
+            (name.clone(), info.hash16k.clone())
+        })
+        .collect();
+    
+    Ok(MatchResult {
+        matched_files,
+        missing_files,
+    })
+}
 
-            // Compute hash16k for this file
-            match Self::compute_hash16k(&path) {
-                Ok(hash) => {
-                    // Check if this hash matches any PAR2 entry
-                    if hash_to_expected_name.contains_key(&hash) {
-                        hash_to_path.insert(hash.clone(), path.clone());
-
-                        let expected_name = &hash_to_expected_name[&hash];
-                        let actual_name = path.file_name().unwrap().to_string_lossy();
-
-                        if expected_name == &actual_name {
-                            println!("✓ {actual_name} matches (correct name)");
-                        } else {
-                            println!(
-                                "✓ {actual_name} matches hash for '{expected_name}' (needs rename)"
-                            );
-                        }
+pub fn rename_files_to_match_par2(
+    directory: &Path,
+    par2_info: &HashMap<String, FilePar2Info>,
+    dry_run: bool,
+) -> io::Result<u32> {
+    let match_result = match_files_to_par2(directory, par2_info)?;
+    let mut rename_count = 0;
+    
+    for file_match in match_result.matched_files {
+        if let Some(expected_name) = file_match.expected_name {
+            let current_name = file_match.path.file_name().unwrap().to_string_lossy();
+            
+            if current_name != expected_name {
+                let new_path = directory.join(&expected_name);
+                
+                if dry_run {
+                    println!("Would rename: {current_name} -> {expected_name}");
+                } else {
+                    // Check if target exists
+                    if new_path.exists() {
+                        eprintln!("Error: Target file {expected_name} already exists");
+                        continue;
                     }
+                    
+                    fs::rename(&file_match.path, &new_path)?;
+                    println!("Renamed: {current_name} -> {expected_name}");
                 }
-                Err(e) => eprintln!("Error reading {}: {}", path.display(), e),
+                rename_count += 1;
             }
         }
+    }
+    
+    Ok(rename_count)
+}
 
-        // Report missing files
-        for (hash, expected_name) in &hash_to_expected_name {
-            if !hash_to_path.contains_key(hash) {
-                println!("✗ {expected_name} not found (hash: {hash:?})");
-            }
+pub fn find_file_by_hash16k(
+    directory: &Path,
+    target_hash: &[u8],
+) -> io::Result<Option<PathBuf>> {
+    for entry in fs::read_dir(directory)? {
+        let entry = entry?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            continue;
         }
 
-        Ok(hash_to_path)
+        if let Ok(hash) = compute_hash16k(&path) {
+            if hash == target_hash {
+                return Ok(Some(path));
+            }
+        }
     }
 
-    pub fn rename_files_to_match_par2(
-        directory: &Path,
-        par2_info: &HashMap<String, FilePar2Info>,
-        dry_run: bool,
-    ) -> io::Result<()> {
-        // Create hash -> (expected_name, filesize) lookup
-        let mut hash_to_info: HashMap<Vec<u8>, (&str, u64)> = HashMap::new();
-        for (filename, info) in par2_info {
-            hash_to_info.insert(info.hash16k.clone(), (filename.as_str(), info.filesize));
+    Ok(None)
+}
+
+pub fn create_par2_to_actual_mapping(
+    directory: &Path,
+    par2_info: &HashMap<String, FilePar2Info>,
+) -> io::Result<HashMap<String, PathBuf>> {
+    let match_result = match_files_to_par2(directory, par2_info)?;
+    
+    let mut mapping = HashMap::new();
+    for file_match in match_result.matched_files {
+        if let Some(expected_name) = file_match.expected_name {
+            mapping.insert(expected_name, file_match.path);
         }
-
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() || path.extension().is_some_and(|ext| ext == "par2") {
-                continue;
-            }
-
-            // Get file size for additional validation
-            let metadata = path.metadata()?;
-            let file_size = metadata.len();
-
-            if let Ok(hash) = Self::compute_hash16k(&path) {
-                if let Some((expected_name, expected_size)) = hash_to_info.get(&hash) {
-                    let current_name = path.file_name().unwrap().to_string_lossy();
-
-                    if current_name != *expected_name {
-                        // Verify size matches too for extra safety
-                        if file_size == *expected_size {
-                            let new_path = directory.join(expected_name);
-
-                            if dry_run {
-                                println!("Would rename: {current_name} -> {expected_name}");
-                            } else {
-                                std::fs::rename(&path, &new_path)?;
-                                println!("Renamed: {current_name} -> {expected_name}");
-                            }
-                        } else {
-                            println!("Warning: {current_name} matches hash but size differs ({file_size}b vs {expected_size}b expected)");
-                        }
-                    }
-                }
-            }
-        }
-
-        Ok(())
     }
-
-    // Convenience function to find a single file by hash
-    pub fn find_file_by_hash16k(
-        directory: &Path,
-        target_hash: &[u8],
-    ) -> io::Result<Option<PathBuf>> {
-        for entry in std::fs::read_dir(directory)? {
-            let entry = entry?;
-            let path = entry.path();
-
-            if path.is_dir() {
-                continue;
-            }
-
-            if let Ok(hash) = Self::compute_hash16k(&path) {
-                if hash == target_hash {
-                    return Ok(Some(path));
-                }
-            }
-        }
-
-        Ok(None)
-    }
+    
+    Ok(mapping)
 }
 
 // Example usage
@@ -162,7 +210,7 @@ mod tests {
         ];
         let directory = Path::new("/tmp/downloaded/");
 
-        match Par2Matcher::find_file_by_hash16k(directory, &target_hash) {
+        match find_file_by_hash16k(directory, &target_hash) {
             Ok(Some(path)) => println!("Found file: {}", path.display()),
             Ok(None) => println!("No file found with that hash"),
             Err(e) => eprintln!("Error: {e}"),
