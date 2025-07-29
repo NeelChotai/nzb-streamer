@@ -1,254 +1,46 @@
-use std::fmt;
+use std::{error::Error, string::FromUtf8Error};
+
+use axum::{extract::multipart::MultipartError, response::{IntoResponse, Response}, Json};
+use http::StatusCode;
+use serde_json::json;
 use thiserror::Error;
+use tracing::error;
 
-#[derive(Error, Debug)]
-pub enum NzbStreamerError {
-    #[error("NZB parsing error: {0}")]
-    NzbParsing(String),
+use crate::{nzb::error::NzbError, par2::error::Par2Error};
 
-    #[error("NNTP connection error: {0}")]
-    NntpConnection(String),
+#[derive(Debug, Error)]
+pub enum RestError {
+    #[error("Error encountered reading upload as NZB file")]
+    NzbParse(#[from] NzbError),
 
-    #[error("NNTP protocol error: {0}")]
-    NntpProtocol(String),
+    #[error("Error encountered during file upload")]
+    MultiPart(#[from] MultipartError),
 
-    #[error("NNTP authentication failed: {0}")]
-    NntpAuth(String),
+    #[error("Please upload an NZB file using the 'nzb' form field")]
+    MissingNzb,
 
-    #[error("Article not found: {0}")]
-    ArticleNotFound(String),
+    #[error("Error encountered reading uploaded file contents")]
+    Utf8Parse(#[from] FromUtf8Error),
 
-    #[error("Article corrupt or invalid: {message_id}")]
-    ArticleCorrupt { message_id: String },
+    #[error("Error encountered attempting to decode PAR2 recovery file.")]
+    Par2(#[from] Par2Error),
 
-    #[error("yEnc decoding error: {0}")]
-    YencDecoding(String),
-
-    #[error("yEnc validation error: {0}")]
-    YencValidation(String),
-
-    #[error("RAR parsing error: {0}")]
-    RarParsing(String),
-
-    #[error("RAR file not found in archive: {filename}")]
-    RarFileNotFound { filename: String },
-
-    #[error("Unsupported RAR compression method: {method}")]
-    UnsupportedRarMethod { method: u8 },
-
-    #[error("HTTP range request error: {0}")]
-    HttpRange(String),
-
-    #[error("Invalid byte range: start={start}, end={end}, file_size={file_size}")]
-    InvalidRange {
-        start: u64,
-        end: u64,
-        file_size: u64,
-    },
-
-    #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
-
-    #[error("Network error: {0}")]
-    Network(String),
-
-    #[error("Configuration error: {0}")]
-    Config(String),
-
-    #[error("Session not found: {session_id}")]
-    SessionNotFound { session_id: String },
-
-    #[error("Cache error: {0}")]
-    Cache(String),
-
-    #[error("Streaming server error: {0}")]
-    StreamingServer(String),
-
-    #[error("Stream not found: {stream_id}")]
-    StreamNotFound { stream_id: String },
-
-    #[error("Download task failed: {task_id} - {reason}")]
-    DownloadTaskFailed { task_id: String, reason: String },
-
-    #[error("Priority queue error: {0}")]
-    PriorityQueue(String),
-
-    #[error("Segment not available: {segment_id}")]
-    SegmentNotAvailable { segment_id: String },
-
-    #[error("Cache corruption detected: {0}")]
-    CacheCorruption(String),
-
-    #[error("Concurrent access error: {0}")]
-    ConcurrentAccess(String),
-
-    #[error("Connection pool error: {0}")]
-    ConnectionPool(String),
-
-    #[error("Timeout error: {0}")]
-    Timeout(String),
-
-    #[error("Download pool error: {0}")]
-    PoolError(String),
-
-    #[error("Download scheduler error: {0}")]
-    SchedulerError(String),
-
-    #[error("NNTP error: {0}")]
-    NntpError(String),
 }
 
-// Removed quick_xml error handling - using nzb-rs instead
+impl IntoResponse for RestError {
+    fn into_response(self) -> Response {
+        error!("{}: {:?}", self, self.source());
 
-impl From<native_tls::Error> for NzbStreamerError {
-    fn from(err: native_tls::Error) -> Self {
-        NzbStreamerError::NntpConnection(err.to_string())
-    }
-}
-
-impl From<http_range_header::RangeUnsatisfiableError> for NzbStreamerError {
-    fn from(err: http_range_header::RangeUnsatisfiableError) -> Self {
-        NzbStreamerError::HttpRange(err.to_string())
-    }
-}
-
-impl From<axum::http::Error> for NzbStreamerError {
-    fn from(err: axum::http::Error) -> Self {
-        NzbStreamerError::HttpRange(err.to_string())
-    }
-}
-
-// Enhanced error mapping for better integration with external crates
-impl NzbStreamerError {
-    /// Create an NNTP connection error from any error type
-    pub fn nntp_connection<E: fmt::Display>(err: E) -> Self {
-        NzbStreamerError::NntpConnection(err.to_string())
-    }
-
-    /// Create an NNTP protocol error from any error type
-    pub fn nntp_protocol<E: fmt::Display>(err: E) -> Self {
-        NzbStreamerError::NntpProtocol(err.to_string())
-    }
-
-    /// Create a yEnc decoding error from any error type
-    pub fn yenc_decoding<E: fmt::Display>(err: E) -> Self {
-        NzbStreamerError::YencDecoding(err.to_string())
-    }
-
-    /// Create a connection pool error from any error type
-    pub fn connection_pool<E: fmt::Display>(err: E) -> Self {
-        NzbStreamerError::ConnectionPool(err.to_string())
-    }
-
-    /// Create a timeout error from any error type
-    pub fn timeout<E: fmt::Display>(err: E) -> Self {
-        NzbStreamerError::Timeout(err.to_string())
-    }
-
-    /// Check if this error is retryable (network/connection issues)
-    pub fn is_retryable(&self) -> bool {
-        matches!(
-            self,
-            NzbStreamerError::NntpConnection(_)
-                | NzbStreamerError::Network(_)
-                | NzbStreamerError::Timeout(_)
-                | NzbStreamerError::ConnectionPool(_)
-                | NzbStreamerError::PoolError(_)
-                | NzbStreamerError::NntpError(_)
-        )
-    }
-
-    /// Check if this error indicates a missing article
-    pub fn is_article_missing(&self) -> bool {
-        matches!(self, NzbStreamerError::ArticleNotFound(_))
-    }
-
-    /// Check if this error indicates data corruption
-    pub fn is_corruption(&self) -> bool {
-        matches!(
-            self,
-            NzbStreamerError::ArticleCorrupt { .. }
-                | NzbStreamerError::YencValidation(_)
-                | NzbStreamerError::RarParsing(_)
-                | NzbStreamerError::CacheCorruption(_)
-        )
-    }
-
-    /// Create a streaming server error from any error type
-    pub fn streaming_server<E: fmt::Display>(err: E) -> Self {
-        NzbStreamerError::StreamingServer(err.to_string())
-    }
-
-    /// Create a cache error from any error type
-    pub fn cache<E: fmt::Display>(err: E) -> Self {
-        NzbStreamerError::Cache(err.to_string())
-    }
-
-    /// Create a priority queue error from any error type
-    pub fn priority_queue<E: fmt::Display>(err: E) -> Self {
-        NzbStreamerError::PriorityQueue(err.to_string())
-    }
-
-    /// Check if this error is related to streaming operations
-    pub fn is_streaming_error(&self) -> bool {
-        matches!(
-            self,
-            NzbStreamerError::StreamingServer(_)
-                | NzbStreamerError::StreamNotFound { .. }
-                | NzbStreamerError::DownloadTaskFailed { .. }
-                | NzbStreamerError::PriorityQueue(_)
-                | NzbStreamerError::SegmentNotAvailable { .. }
-                | NzbStreamerError::CacheCorruption(_)
-                | NzbStreamerError::ConcurrentAccess(_)
-        )
-    }
-
-    /// Check if this error indicates a missing resource
-    pub fn is_not_found(&self) -> bool {
-        matches!(
-            self,
-            NzbStreamerError::ArticleNotFound(_)
-                | NzbStreamerError::SessionNotFound { .. }
-                | NzbStreamerError::StreamNotFound { .. }
-                | NzbStreamerError::SegmentNotAvailable { .. }
-                | NzbStreamerError::RarFileNotFound { .. }
-        )
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_error_classification() {
-        let conn_error = NzbStreamerError::NntpConnection("test".to_string());
-        assert!(conn_error.is_retryable());
-        assert!(!conn_error.is_article_missing());
-        assert!(!conn_error.is_corruption());
-
-        let missing_error = NzbStreamerError::ArticleNotFound("test".to_string());
-        assert!(!missing_error.is_retryable());
-        assert!(missing_error.is_article_missing());
-        assert!(!missing_error.is_corruption());
-
-        let corrupt_error = NzbStreamerError::ArticleCorrupt {
-            message_id: "test".to_string(),
+        let status = match self {
+            RestError::NzbParse(_) => StatusCode::BAD_REQUEST,
+            RestError::MultiPart(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            RestError::MissingNzb => StatusCode::BAD_REQUEST,
+            RestError::Utf8Parse(_) => StatusCode::BAD_REQUEST,
+            RestError::Par2(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
-        assert!(!corrupt_error.is_retryable());
-        assert!(!corrupt_error.is_article_missing());
-        assert!(corrupt_error.is_corruption());
-    }
 
-    #[test]
-    fn test_error_helper_methods() {
-        let err = NzbStreamerError::nntp_connection("test error");
-        assert!(matches!(err, NzbStreamerError::NntpConnection(_)));
+        let payload = Json(json!({"message": self.to_string()}));
 
-        let err = NzbStreamerError::yenc_decoding(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "bad data",
-        ));
-        assert!(matches!(err, NzbStreamerError::YencDecoding(_)));
+        (status, payload).into_response()
     }
 }

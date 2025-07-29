@@ -2,6 +2,8 @@ use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::Path;
 
+pub mod mkv;
+
 const RAR_SIGNATURE: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 const MKV_SIGNATURE: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
 
