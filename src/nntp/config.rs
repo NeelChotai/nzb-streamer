@@ -26,3 +26,13 @@ impl NntpConfig {
         Ok(config)
     }
 }
+
+#[derive(Debug, Clone)]
+pub struct DownloadStatus {
+    pub total_files: usize,
+    pub downloaded_files: usize,
+    pub total_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub current_file: Option<String>,
+    pub is_complete: bool,
+}

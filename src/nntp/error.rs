@@ -22,4 +22,7 @@ pub enum NntpError {
 
     #[error("network error: {0}")]
     Network(String),
+
+    #[error("Bandwidth limiter error")]
+    Bandwidth,
 }

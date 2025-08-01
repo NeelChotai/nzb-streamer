@@ -13,8 +13,8 @@ pub struct ConnectionPool {
 impl ConnectionPool {
     pub fn new(config: NntpConfig) -> Self {
         let max_connections = config.max_connections.unwrap_or_else(|| {
-            warn!("Max connections not provided. Using default (10)");
-            10
+            warn!("Max connections not provided. Using default (40)");
+            40
         });
 
         Self {

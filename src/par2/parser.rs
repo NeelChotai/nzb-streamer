@@ -11,8 +11,8 @@ use nom::{
 };
 
 use crate::par2::error::Par2Error;
-use crate::par2::par2_crc32;
 use crate::par2::packet::{FileDescPacket, IFSCPacket, MainPacket, Packet};
+use crate::par2::par2_crc32;
 
 const PAR_PKT_ID: &[u8] = b"PAR2\x00PKT";
 const PAR_MAIN_ID: &[u8] = b"PAR 2.0\x00Main\x00\x00\x00\x00";
@@ -76,47 +76,47 @@ fn scan_for_packets(buffer: &[u8]) -> Result<Vec<Packet>, Par2Error> {
 fn parse_packet(input: &[u8]) -> IResult<&[u8], Option<Packet>> {
     let (input, _) = tag(PAR_PKT_ID)(input)?;
     let (input, pack_len) = le_u64(input)?;
-    
+
     if pack_len < HEADER_SIZE {
         return Ok((input, None));
     }
-    
+
     let pack_len = pack_len as usize;
     let total_needed = pack_len - MD5_SIZE - PAR_PKT_ID.len() - 8; // Already consumed header + length
-    
+
     if input.len() < total_needed {
         return Ok((&input[input.len()..], None));
     }
-    
+
     // Skip MD5 checksum
     let (input, _md5) = take(MD5_SIZE)(input)?;
-    
+
     // Get the data portion
     let data_len = pack_len - (PAR_PKT_ID.len() + 8 + MD5_SIZE); // Total packet minus what we've consumed
     let (remaining, data) = take(data_len)(input)?;
-    
+
     // Skip Recovery Set ID and get packet type
     if data.len() < RECOVERY_SET_SIZE + PACKET_TYPE_SIZE {
         return Ok((remaining, None));
     }
-    
+
     let packet_type = &data[RECOVERY_SET_SIZE..RECOVERY_SET_SIZE + PACKET_TYPE_SIZE];
-    
+
     let packet = match packet_type {
         PAR_MAIN_ID => parse_main_packet(data).ok(),
         PAR_FILE_ID => parse_file_packet(data).ok(),
         PAR_SLICE_ID => parse_slice_packet(data).ok(),
         _ => None,
     };
-    
+
     Ok((remaining, packet))
 }
 
 fn parse_main_packet(data: &[u8]) -> Result<Packet, Par2Error> {
     let offset = RECOVERY_SET_SIZE + PACKET_TYPE_SIZE;
-    let (_, slice_size) = le_u64::<_, nom::error::Error<_>>(&data[offset..])
-        .map_err(|_| Par2Error::Parse)?;
-    
+    let (_, slice_size) =
+        le_u64::<_, nom::error::Error<_>>(&data[offset..]).map_err(|_| Par2Error::Parse)?;
+
     Ok(Packet::Main(MainPacket { slice_size }))
 }
 
@@ -132,7 +132,7 @@ fn parse_file_packet(data: &[u8]) -> Result<Packet, Par2Error> {
     let hash16k = data[hash16k_offset..hash16k_offset + MD5_SIZE].to_vec();
     let filesize_offset = hash16k_offset + MD5_SIZE;
     let filesize = LittleEndian::read_u64(&data[filesize_offset..filesize_offset + 8]);
-    
+
     // Parse filename
     let filename_offset = filesize_offset + 8;
     let filename_bytes = &data[filename_offset..];
@@ -183,10 +183,7 @@ fn build_file_info(packets: Vec<Packet>) -> Result<HashMap<String, FilePar2Info>
                 file_info.insert(desc.file_id.clone(), desc);
             }
             Packet::IFSC(ifsc) => {
-                file_crcs
-                    .entry(ifsc.file_id)
-                    .or_default()
-                    .extend(ifsc.crcs);
+                file_crcs.entry(ifsc.file_id).or_default().extend(ifsc.crcs);
             }
         }
     }
@@ -244,6 +241,43 @@ mod tests {
     #[test]
     fn test_parse_par2() {
         let path = Path::new("/tmp/downloaded/db5839e271decea10e9e713aa0e20573.par2");
+
+        match parse_par2_file(path) {
+            Ok(table) => {
+                for (filename, info) in &table {
+                    println!("{filename}: FilePar2Info {{");
+                    println!("    hash16k: {:?},", info.hash16k);
+                    println!("    filesize: {},", info.filesize);
+                    println!("    filehash: {},", info.filehash);
+                    println!("}}");
+                }
+            }
+            Err(e) => eprintln!("Error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_par2_again() {
+        //let path = Path::new("/tmp/test_nntp/downloads/0ae5e6761c69051d401054734c174e91.par2");
+        let path = Path::new("/tmp/nzb/downloads/downloads/inter/Foundation.S03E03.When.a.Book.Finds.You.1080p.ATVP.WEB-DL.DDP5.1.H.264-NTb.#4/0ae5e6761c69051d401054734c174e91.par2");
+
+        match parse_par2_file(path) {
+            Ok(table) => {
+                for (filename, info) in &table {
+                    println!("{filename}: FilePar2Info {{");
+                    println!("    hash16k: {:?},", info.hash16k);
+                    println!("    filesize: {},", info.filesize);
+                    println!("    filehash: {},", info.filehash);
+                    println!("}}");
+                }
+            }
+            Err(e) => eprintln!("Error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_parse_par2_again_again() {
+        let path = Path::new("/tmp/test_nntp/downloads/test.par2");
 
         match parse_par2_file(path) {
             Ok(table) => {

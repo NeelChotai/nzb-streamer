@@ -14,7 +14,7 @@ pub struct FileMatch {
     pub path: PathBuf,
     pub hash16k: Vec<u8>,
     pub size: u64,
-    pub expected_name: Option<String>,
+    pub real_name: Option<String>,
 }
 
 /// Result of matching files against PAR2 info
@@ -40,7 +40,7 @@ pub fn compute_hash16k(path: &Path) -> io::Result<Vec<u8>> {
 /// Scan directory and compute hash16k for all non-PAR2 files
 pub fn scan_directory(directory: &Path) -> io::Result<Vec<(PathBuf, Vec<u8>, u64)>> {
     let mut files = Vec::new();
-    
+
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -58,7 +58,7 @@ pub fn scan_directory(directory: &Path) -> io::Result<Vec<(PathBuf, Vec<u8>, u64
             Err(e) => eprintln!("Error reading {}: {}", path.display(), e),
         }
     }
-    
+
     Ok(files)
 }
 
@@ -67,48 +67,47 @@ pub fn match_files_to_par2(
     par2_info: &HashMap<String, FilePar2Info>,
 ) -> io::Result<MatchResult> {
     // Build lookup tables
-    let mut hash_to_expected: HashMap<Vec<u8>, (&str, u64)> = HashMap::new();
+    let mut hash_to_real: HashMap<Vec<u8>, (&str, u64)> = HashMap::new();
     for (filename, info) in par2_info {
-        hash_to_expected.insert(info.hash16k.clone(), (filename.as_str(), info.filesize));
+        hash_to_real.insert(info.hash16k.clone(), (filename.as_str(), info.filesize));
     }
-    
+
     // Scan directory once
     let scanned_files = scan_directory(directory)?;
-    
+
     // Match files
     let mut matched_files = Vec::new();
     let mut found_hashes = HashMap::new();
-    
+
     for (path, hash, size) in scanned_files {
-        if let Some((expected_name, expected_size)) = hash_to_expected.get(&hash) {
+        if let Some((real_name, expected_size)) = hash_to_real.get(&hash) {
             let current_name = path.file_name().unwrap().to_string_lossy();
-            
+
             // Verify size matches for extra validation
             if size != *expected_size {
                 eprintln!(
                     "Warning: {current_name} matches hash but size differs ({size}b vs {expected_size}b expected)"
                 );
-                continue;
             }
-            
+
             found_hashes.insert(hash.clone(), ());
-            
-            let needs_rename = current_name != *expected_name;
+
+            let needs_rename = current_name != *real_name;
             if needs_rename {
-                println!("✓ {current_name} matches hash for '{expected_name}' (needs rename)");
+                println!("✓ {current_name} matches hash for '{real_name}' (needs rename)");
             } else {
                 println!("✓ {current_name} matches (correct name)");
             }
-            
+
             matched_files.push(FileMatch {
                 path,
                 hash16k: hash,
                 size,
-                expected_name: Some(expected_name.to_string()),
+                real_name: Some(real_name.to_string()),
             });
         }
     }
-    
+
     // Find missing files
     let missing_files: Vec<_> = par2_info
         .iter()
@@ -118,7 +117,7 @@ pub fn match_files_to_par2(
             (name.clone(), info.hash16k.clone())
         })
         .collect();
-    
+
     Ok(MatchResult {
         matched_files,
         missing_files,
@@ -132,38 +131,35 @@ pub fn rename_files_to_match_par2(
 ) -> io::Result<u32> {
     let match_result = match_files_to_par2(directory, par2_info)?;
     let mut rename_count = 0;
-    
+
     for file_match in match_result.matched_files {
-        if let Some(expected_name) = file_match.expected_name {
+        if let Some(real_name) = file_match.real_name {
             let current_name = file_match.path.file_name().unwrap().to_string_lossy();
-            
-            if current_name != expected_name {
-                let new_path = directory.join(&expected_name);
-                
+
+            if current_name != real_name {
+                let new_path = directory.join(&real_name);
+
                 if dry_run {
-                    println!("Would rename: {current_name} -> {expected_name}");
+                    println!("Would rename: {current_name} -> {real_name}");
                 } else {
                     // Check if target exists
                     if new_path.exists() {
-                        eprintln!("Error: Target file {expected_name} already exists");
+                        eprintln!("Error: Target file {real_name} already exists");
                         continue;
                     }
-                    
+
                     fs::rename(&file_match.path, &new_path)?;
-                    println!("Renamed: {current_name} -> {expected_name}");
+                    println!("Renamed: {current_name} -> {real_name}");
                 }
                 rename_count += 1;
             }
         }
     }
-    
+
     Ok(rename_count)
 }
 
-pub fn find_file_by_hash16k(
-    directory: &Path,
-    target_hash: &[u8],
-) -> io::Result<Option<PathBuf>> {
+pub fn find_file_by_hash16k(directory: &Path, target_hash: &[u8]) -> io::Result<Option<PathBuf>> {
     for entry in fs::read_dir(directory)? {
         let entry = entry?;
         let path = entry.path();
@@ -187,20 +183,22 @@ pub fn create_par2_to_actual_mapping(
     par2_info: &HashMap<String, FilePar2Info>,
 ) -> io::Result<HashMap<String, PathBuf>> {
     let match_result = match_files_to_par2(directory, par2_info)?;
-    
+
     let mut mapping = HashMap::new();
     for file_match in match_result.matched_files {
-        if let Some(expected_name) = file_match.expected_name {
+        if let Some(expected_name) = file_match.real_name {
             mapping.insert(expected_name, file_match.path);
         }
     }
-    
+
     Ok(mapping)
 }
 
 // Example usage
 #[cfg(test)]
 mod tests {
+    use crate::par2::{self, parser::parse_par2_file};
+
     use super::*;
 
     #[test]
@@ -211,6 +209,34 @@ mod tests {
         let directory = Path::new("/tmp/downloaded/");
 
         match find_file_by_hash16k(directory, &target_hash) {
+            Ok(Some(path)) => println!("Found file: {}", path.display()),
+            Ok(None) => println!("No file found with that hash"),
+            Err(e) => eprintln!("Error: {e}"),
+        }
+    }
+
+    #[test]
+    fn test_find_and_match() {
+        let directory = Path::new("/tmp/downloaded/");
+
+        let par2 =
+            parse_par2_file(&directory.join("db5839e271decea10e9e713aa0e20573.par2")).unwrap();
+        let matches = match_files_to_par2(directory, &par2).unwrap();
+
+        println!("{matches:#?}");
+    }
+
+    #[test]
+    fn test_find_file_extended() {
+        let directory = Path::new("/tmp/binzb/c312fa70-1b42-4cab-9372-723c89db0c46");
+
+        let parsed =
+            par2::parser::parse_par2_file(&directory.join("0ae5e6761c69051d401054734c174e91.par2"))
+                .unwrap();
+        println!("parsed: {parsed:?}");
+        let target_hash = &parsed.get("yay.rar").unwrap().hash16k;
+
+        match find_file_by_hash16k(directory, target_hash) {
             Ok(Some(path)) => println!("Found file: {}", path.display()),
             Ok(None) => println!("No file found with that hash"),
             Err(e) => eprintln!("Error: {e}"),

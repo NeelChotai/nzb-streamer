@@ -1,125 +1,324 @@
+use bytes::{Bytes, BytesMut};
+use futures::{Stream, StreamExt};
 use std::{
-    io::{self, SeekFrom}, path::{Path, PathBuf}, pin::Pin, sync::Arc
+    io::{self, SeekFrom},
+    path::{Path, PathBuf},
+    sync::Arc,
 };
 use tokio::{
     fs::File,
-    io::{AsyncRead, AsyncReadExt, AsyncSeek, AsyncSeekExt, ReadBuf},
+    io::{AsyncReadExt, AsyncSeekExt, ReadBuf},
+    sync::RwLock,
 };
-use bytes::Bytes;
-use futures::{Stream, StreamExt};
-use tokio_util::io::ReaderStream;
-use crate::par2::matcher::FileMatch;
+use tracing::{debug, info};
 
 const RAR_SIGNATURE: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 const MKV_SIGNATURE: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
 
+const VIDEO_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MB chunks
+const PREFETCH_SIZE: usize = 16 * 1024 * 1024; // 16MB prefetch buffer
+
 #[derive(Debug, Clone)]
-struct VolumeSegment {
-    path: PathBuf,
-    start: u64,
-    length: u64,
+pub struct VolumeSegment {
+    pub path: PathBuf,
+    pub start: u64,
+    pub length: u64,
+    pub virtual_start: u64,
+    pub is_complete: bool,
 }
 
 pub struct MkvStreamer {
-    segments: Vec<VolumeSegment>,
-    total_size: u64,
+    segments: Arc<RwLock<Vec<VolumeSegment>>>,
 }
 
 impl MkvStreamer {
-    pub async fn new(rar_directory: &Path, file_matches: &[FileMatch]) -> io::Result<Self> {
+    pub async fn new(sorted_files: &[PathBuf]) -> io::Result<Self> {
         let mut segments = Vec::new();
-        let mut total_size = 0;
-        
-        // Create a custom sorter for RAR volumes
-        let mut sorted_files = file_matches.to_vec();
-        sorted_files.sort_by(|a, b| {
-            // Extract base names for comparison
-            let a_name = a.expected_name.as_deref().unwrap_or("");
-            let b_name = b.expected_name.as_deref().unwrap_or("");
-            
-            // Handle .rar as first volume
-            if a_name.ends_with(".rar") && !b_name.ends_with(".rar") {
-                return std::cmp::Ordering::Less;
-            }
-            if !a_name.ends_with(".rar") && b_name.ends_with(".rar") {
-                return std::cmp::Ordering::Greater;
-            }
-            
-            // Handle .rXX volumes
-            let a_ext = a_name.rsplit('.').next().unwrap_or("");
-            let b_ext = b_name.rsplit('.').next().unwrap_or("");
-            
-            // Special case: .r00 comes after .rar but before .r01
-            if a_ext.starts_with('r') && b_ext.starts_with('r') {
-                let a_num = a_ext[1..].parse::<u32>().unwrap_or(u32::MAX);
-                let b_num = b_ext[1..].parse::<u32>().unwrap_or(u32::MAX);
-                return a_num.cmp(&b_num);
-            }
-            
-            // Fallback: alphabetical order
-            a_name.cmp(b_name)
-        });
-        
-        // Debug print sorted order
-        println!("Sorted RAR volumes:");
-        for file in &sorted_files {
-            println!("- {}", file.expected_name.as_deref().unwrap_or("unknown"));
-        }
-        
-        for (idx, file_match) in sorted_files.iter().enumerate() {
-            let is_first = idx == 0;
-            let (start, length) = analyze_rar_volume(
-                Path::new(&file_match.path),
-                is_first
-            ).await?;
-            
+
+        for path in sorted_files.iter() {
             segments.push(VolumeSegment {
-                path: PathBuf::from(&file_match.path),
-                start,
-                length,
+                path: path.to_path_buf(),
+                start: 0,
+                length: 0,
+                virtual_start: 0u64,
+                is_complete: false,
             });
-            
-            total_size += length;
         }
-        
-        Ok(Self { segments, total_size })
+
+        Ok(Self {
+            segments: Arc::new(RwLock::new(segments)),
+        })
     }
-    
-    pub fn total_size(&self) -> u64 {
-        self.total_size
+
+    pub async fn get_available_bytes(&self) -> u64 {
+        let segments = self.segments.read().await;
+        let mut available = 0u64;
+
+        for segment in segments.iter() {
+            if segment.is_complete {
+                available = segment.virtual_start + segment.length;
+            } else {
+                // Stop at first incomplete segment
+                break;
+            }
+        }
+
+        available
     }
-    
+
+    pub async fn mark_segment_downloaded(&self, path: &Path) -> io::Result<()> {
+        let mut segments = self.segments.write().await;
+        let segment_idx = segments
+            .iter()
+            .position(|s| s.path == path)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Segment not found"))?;
+        let is_first = segment_idx == 0;
+
+        let (start, length) = analyse_rar_volume(path, is_first).await?;
+
+        let segment = &mut segments[segment_idx];
+        segment.start = start;
+        segment.length = length;
+        segment.is_complete = true;
+
+        let mut next_virtual_start = 0;
+        let mut available_bytes = 0;
+        let mut gap_encountered = false;
+
+        for seg in segments.iter_mut() {
+            seg.virtual_start = next_virtual_start;
+
+            if !gap_encountered && seg.is_complete {
+                next_virtual_start += seg.length;
+                available_bytes = next_virtual_start; // Track contiguous bytes
+            } else if !seg.is_complete {
+                // Found first gap - subsequent segments aren't contiguous
+                gap_encountered = true;
+            }
+        }
+
+        info!(
+            "Marked {} as complete. Available bytes: {}",
+            path.display(),
+            available_bytes
+        );
+
+        Ok(())
+    }
+
     pub fn stream(self) -> impl Stream<Item = io::Result<Bytes>> + 'static {
         async_stream::try_stream! {
-            for segment in self.segments {
+            let streamer = self.segments.read().await.clone();
+
+            for segment in streamer {
                 let mut file = File::open(&segment.path).await?;
                 file.seek(std::io::SeekFrom::Start(segment.start)).await?;
-                
+
                 let mut remaining = segment.length;
                 let mut buffer = vec![0; 64 * 1024]; // 64KB buffer
-                
+
                 while remaining > 0 {
                     let read_size = buffer.len().min(remaining as usize);
                     let buffer_slice = &mut buffer[..read_size];
-                    
+
                     let mut read_buf = ReadBuf::new(buffer_slice);
                     file.read_buf(&mut read_buf).await?;
-                    
+
                     let filled = read_buf.filled();
                     if filled.is_empty() {
                         break;
                     }
-                    
+
                     yield Bytes::copy_from_slice(filled);
                     remaining -= filled.len() as u64;
                 }
             }
         }
     }
+
+    pub fn read_range(
+        &self,
+        start: u64,
+        length: u64,
+    ) -> impl Stream<Item = io::Result<Bytes>> + Send + 'static {
+        let segments = Arc::clone(&self.segments);
+        let end = start + length;
+
+        async_stream::try_stream! {
+            let snapshot = segments.read().await.clone();
+
+            let mut buffer = BytesMut::with_capacity(VIDEO_CHUNK_SIZE + PREFETCH_SIZE);
+            let mut current_pos = start;
+            let mut current_file: Option<(PathBuf, File)> = None;
+
+             while current_pos < end {
+                // Find the segment containing current_pos
+                let segment = match snapshot
+                    .iter()
+                    .find(|s| s.virtual_start <= current_pos && current_pos < s.virtual_start + s.length)
+                {
+                    Some(s) => s,
+                    None => break,
+                };
+
+                // Reuse file handle if it's the same segment
+                let file = match &mut current_file {
+                    Some((path, file)) if path == &segment.path => file,
+                    _ => {
+                        let new_file = File::open(&segment.path).await?;
+                        current_file = Some((segment.path.clone(), new_file));
+                        &mut current_file.as_mut().unwrap().1
+                    }
+                };
+
+                // Calculate read position
+                let seg_offset = current_pos - segment.virtual_start;
+                let physical_pos = segment.start + seg_offset;
+                file.seek(SeekFrom::Start(physical_pos)).await?;
+
+                // Calculate how much to read
+                let segment_end = segment.virtual_start + segment.length;
+                let read_end = end.min(segment_end);
+                let total_to_read = (read_end - current_pos) as usize;
+
+                // Read a large chunk (up to VIDEO_CHUNK_SIZE)
+                let chunk_size = total_to_read.min(VIDEO_CHUNK_SIZE);
+                buffer.clear();
+                buffer.resize(chunk_size, 0);
+
+                let mut bytes_read = 0;
+                while bytes_read < chunk_size {
+                    match file.read(&mut buffer[bytes_read..]).await? {
+                        0 => break,
+                        n => bytes_read += n,
+                    }
+                }
+
+                if bytes_read == 0 {
+                    break;
+                }
+
+                // Yield the entire chunk at once
+                buffer.truncate(bytes_read);
+                yield buffer.clone().freeze();
+
+                current_pos += bytes_read as u64;
+
+                // Optional: Prefetch next chunk in background
+                if current_pos < end && bytes_read == chunk_size {
+                    // The next iteration will read the prefetched data
+                    // This happens automatically due to OS file caching
+                }
+            }
+        }
+    }
+
+    pub fn read_range_with_chunk_size(
+        &self,
+        start: u64,
+        length: u64,
+        chunk_size: usize,
+    ) -> impl Stream<Item = io::Result<Bytes>> + Send + 'static {
+        let segments = Arc::clone(&self.segments);
+        let end = start + length;
+
+        async_stream::try_stream! {
+            let snapshot = segments.read().await.clone();
+
+            let mut max_available = 0u64;
+            for segment in &snapshot {
+                if segment.is_complete {
+                    max_available = segment.virtual_start + segment.length;
+                } else {
+                    break;
+                }
+            }
+
+            let actual_end = end.min(max_available);
+
+            let mut buffer = BytesMut::with_capacity(chunk_size);
+            let mut current_pos = start;
+            let mut pending_data = BytesMut::new();
+
+            for segment in &snapshot {
+                let segment_end = segment.virtual_start + segment.length;
+
+                if segment_end <= current_pos {
+                    continue;
+                }
+
+                if segment.virtual_start >= end {
+                    break;
+                }
+
+                if !segment.is_complete {
+                    break;
+                }
+
+                let mut file = File::open(&segment.path).await?;
+                let seg_offset = current_pos.saturating_sub(segment.virtual_start);
+                file.seek(SeekFrom::Start(segment.start + seg_offset)).await?;
+
+                let segment_read_end = segment_end.min(actual_end);
+                let mut segment_remaining = segment_read_end - current_pos;
+
+                while segment_remaining > 0 && current_pos < actual_end {
+                    // Read into temporary buffer
+                    let to_read = chunk_size.min(segment_remaining as usize);
+                    buffer.clear();
+                    buffer.resize(to_read, 0);
+
+                    let bytes_read = file.read(&mut buffer).await?;
+                    if bytes_read == 0 {
+                        break;
+                    }
+
+                    buffer.truncate(bytes_read);
+                    pending_data.extend_from_slice(&buffer);
+
+                    // Yield complete chunks
+                    while pending_data.len() >= chunk_size {
+                        let chunk = pending_data.split_to(chunk_size);
+                        yield chunk.freeze();
+                    }
+
+                    current_pos += bytes_read as u64;
+                    segment_remaining -= bytes_read as u64;
+                }
+            }
+
+            // Yield any remaining data
+            if !pending_data.is_empty() {
+                yield pending_data.freeze();
+            }
+        }
+    }
+
+    // Optimized method for seeking within the video
+    pub async fn read_at(&self, offset: u64, length: u64) -> io::Result<Bytes> {
+        // Find the segment
+        let segment = self.segments.read().await;
+
+        let chunk = segment
+            .iter()
+            .find(|s| s.virtual_start <= offset && offset < s.virtual_start + s.length)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid offset"))?;
+
+        let mut file = File::open(&chunk.path).await?;
+        let seg_offset = offset - chunk.virtual_start;
+        let physical_pos = chunk.start + seg_offset;
+
+        file.seek(SeekFrom::Start(physical_pos)).await?;
+
+        let read_length = length.min(chunk.virtual_start + chunk.length - offset);
+        let mut buffer = vec![0u8; read_length as usize];
+        file.read_exact(&mut buffer).await?;
+
+        Ok(Bytes::from(buffer))
+    }
 }
 
-/// Async version of your extraction logic
-async fn analyze_rar_volume(path: &Path, is_first: bool) -> io::Result<(u64, u64)> {
+async fn analyse_rar_volume(path: &Path, is_first: bool) -> io::Result<(u64, u64)> {
     let mut file = File::open(path).await?;
     let file_size = file.metadata().await?.len();
 
@@ -130,7 +329,8 @@ async fn analyze_rar_volume(path: &Path, is_first: bool) -> io::Result<(u64, u64
     let rar_offset = sig_buf
         .windows(7)
         .position(|w| w == RAR_SIGNATURE)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No RAR signature"))? as u64;
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No RAR signature"))?
+        as u64;
 
     file.seek(SeekFrom::Start(rar_offset + 7)).await?;
 
@@ -156,10 +356,12 @@ async fn analyze_rar_volume(path: &Path, is_first: bool) -> io::Result<(u64, u64
         let header_size = read_u16_le(&mut file).await?;
 
         match header_type {
-            0x73 => { // MAIN_HEAD
+            0x73 => {
+                // MAIN_HEAD
                 file.seek(SeekFrom::Current(header_size as i64 - 7)).await?;
             }
-            0x74 => { // FILE_HEAD
+            0x74 => {
+                // FILE_HEAD
                 let pack_size = read_u32_le(&mut file).await? as u64;
                 let _ = read_u32_le(&mut file).await?; // unpacked size
 
@@ -176,14 +378,16 @@ async fn analyze_rar_volume(path: &Path, is_first: bool) -> io::Result<(u64, u64
                     let current_pos = data_offset;
                     file.read_exact(&mut search_buf).await?;
 
-                    if let Some(mkv_offset) = search_buf.windows(4).position(|w| w == MKV_SIGNATURE) {
+                    if let Some(mkv_offset) = search_buf.windows(4).position(|w| w == MKV_SIGNATURE)
+                    {
                         data_offset = current_pos + mkv_offset as u64;
                         data_length = pack_size - mkv_offset as u64;
                     }
                 }
                 break;
             }
-            0x7B => { // ENDARC_HEAD
+            0x7B => {
+                // ENDARC_HEAD
                 break;
             }
             _ => {
