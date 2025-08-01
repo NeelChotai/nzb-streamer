@@ -1,12 +1,21 @@
+use std::path::Path;
 
+use crate::nntp::config::DownloadStatus;
 use crate::nntp::pool::ConnectionPool;
 use crate::nntp::NntpClient;
 use crate::nntp::{config::NntpConfig, error::NntpError};
 use async_trait::async_trait;
 use backoff::ExponentialBackoff;
-use nzb_rs::Segment;
+use nzb_rs::{File, Segment};
 use rek2_nntp::body;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::fs;
+use tokio::io::AsyncWriteExt;
+use tokio::sync::Mutex;
 use tokio::time::Duration;
+use tracing::{debug, info};
 
 const MAX_RETRIES: u32 = 3;
 const RETRY_DELAY: Duration = Duration::from_secs(1);
@@ -23,6 +32,89 @@ impl NntpClient for LiveNntpClient {
             Ok(self.download_segment_internal(segment).await?)
         })
         .await
+    }
+
+    async fn download_file(&self, file: &File, output_path: &Path) -> Result<Vec<u8>, NntpError> {
+        let mut data = Vec::new();
+        let total_segments = file.segments.len();
+
+        info!(
+            "Downloading file: {} ({} segments)",
+            file.subject, total_segments
+        );
+
+        // Download segments in order
+        for (idx, segment) in file.segments.iter().enumerate() {
+            debug!(
+                "Downloading segment {}/{}: {}",
+                idx + 1,
+                total_segments,
+                segment.message_id
+            );
+
+            let segment_data = self.download_segment(segment).await?;
+            data.extend_from_slice(&segment_data);
+
+            // Progress update
+            if (idx + 1) % 10 == 0 || idx + 1 == total_segments {
+                debug!("Progress: {}/{} segments", idx + 1, total_segments);
+            }
+        }
+
+        // Write to file
+        let mut output = fs::File::create(output_path).await.unwrap();
+        output.write_all(&data).await.unwrap();
+        output.flush().await.unwrap();
+
+        info!(
+            "Downloaded {} to {:?} ({} bytes)",
+            file.subject,
+            output_path,
+            data.len()
+        );
+        Ok(data)
+    }
+
+    async fn download_files_with_throttle(
+        &self,
+        files: Vec<File>,
+        output_dir: &Path,
+        status: Arc<Mutex<DownloadStatus>>,
+    ) -> Result<HashMap<String, PathBuf>, NntpError> {
+        let mut results = HashMap::new();
+        let total_files = files.len();
+
+        for (idx, file) in files.into_iter().enumerate() {
+            // Update status
+            {
+                let mut status = status.lock().await;
+                status.current_file = Some(file.subject.clone());
+                status.downloaded_files = idx;
+            }
+
+            // Determine output path
+            let filename = extract_filename(&file.subject);
+            let output_path = output_dir.join(&filename);
+            let data = self.download_file(&file, &output_path).await?;
+
+            results.insert(filename.clone(), output_path.clone());
+
+            info!(
+                "Downloaded {}/{}: {} ({} bytes)",
+                idx + 1,
+                total_files,
+                filename,
+                data.len()
+            );
+        }
+
+        // Mark as complete
+        {
+            let mut status = status.lock().await;
+            status.is_complete = true;
+        }
+
+        Ok(results)
     }
 }
 
@@ -116,4 +208,15 @@ impl LiveNntpClient {
     //     debug!("Downloaded {}/{} PAR2 files", results.len(), par2_count);
     //     results
     // }
+}
+
+fn extract_filename(subject: &str) -> String {
+    // Extract filename from subject line
+    // Example: "filename.rar" yEnc (1/10)
+    subject
+        .split('"')
+        .nth(1)
+        .or_else(|| subject.split(' ').next())
+        .unwrap_or(subject)
+        .to_string()
 }

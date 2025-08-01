@@ -1,4 +1,4 @@
 pub mod error;
 pub mod parser;
 
-pub use parser::{Nzb, parse};
+pub use parser::{parse, Nzb};

@@ -1,6 +1,10 @@
 use std::{error::Error, string::FromUtf8Error};
 
-use axum::{extract::multipart::MultipartError, response::{IntoResponse, Response}, Json};
+use axum::{
+    extract::multipart::MultipartError,
+    response::{IntoResponse, Response},
+    Json,
+};
 use http::StatusCode;
 use serde_json::json;
 use thiserror::Error;
@@ -22,9 +26,17 @@ pub enum RestError {
     #[error("Error encountered reading uploaded file contents")]
     Utf8Parse(#[from] FromUtf8Error),
 
-    #[error("Error encountered attempting to decode PAR2 recovery file.")]
+    #[error("Error encountered attempting to decode PAR2 recovery file")]
     Par2(#[from] Par2Error),
 
+    #[error("Invalid range header")]
+    InvalidRange,
+
+    #[error("Requested range not satisfiable")]
+    RangeNotSatisfiable,
+
+    #[error("Session not found")]
+    SessionNotFound,
 }
 
 impl IntoResponse for RestError {
@@ -37,6 +49,9 @@ impl IntoResponse for RestError {
             RestError::MissingNzb => StatusCode::BAD_REQUEST,
             RestError::Utf8Parse(_) => StatusCode::BAD_REQUEST,
             RestError::Par2(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            RestError::InvalidRange => StatusCode::BAD_REQUEST,
+            RestError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
+            RestError::SessionNotFound => StatusCode::NOT_FOUND,
         };
 
         let payload = Json(json!({"message": self.to_string()}));
