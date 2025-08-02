@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use crate::nntp::error::NntpError;
 use crate::nntp::NntpClient;
+use crate::nntp::error::NntpError;
 use nzb_rs::{File, Segment};
 use tokio::sync::Mutex;
 

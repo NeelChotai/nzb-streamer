@@ -1,14 +1,14 @@
 use axum::extract::Path;
 use axum::{
+    Router,
     body::Body,
     extract::{Multipart, State},
     http::StatusCode,
     response::{IntoResponse, Json, Response},
     routing::{get, post},
-    Router,
 };
 use clap::Parser;
-use http::{header, HeaderMap};
+use http::{HeaderMap, header};
 use nzb_rs::File;
 use nzb_streamer::par2::matcher::match_files_to_par2;
 use serde_json::json;
@@ -23,10 +23,10 @@ use uuid::Uuid;
 
 use nzb_streamer::{
     error::RestError,
-    mkv::mkv::MkvStreamer,
-    nntp::{client::nntp_client, config::NntpConfig, simple::SimpleNntpClient, NntpClient},
+    nntp::{NntpClient, client::nntp_client, config::NntpConfig, simple::SimpleNntpClient},
     nzb::{self},
     par2::{matcher::FileMatch, parser::parse_par2_file},
+    streamer::virtual_file_streamer::VirtualFileStreamer,
 };
 
 #[derive(Parser)]
@@ -56,7 +56,7 @@ struct Args {
 
 #[derive(Clone)]
 pub struct AppState {
-    active_streams: Arc<Mutex<HashMap<Uuid, Arc<MkvStreamer>>>>,
+    active_streams: Arc<Mutex<HashMap<Uuid, Arc<VirtualFileStreamer>>>>,
     nntp_client: Arc<dyn NntpClient + Send + Sync>,
     simple: Arc<SimpleNntpClient>,
     mock_mode: bool,
@@ -81,12 +81,16 @@ async fn main() {
 
     dotenvy::dotenv().ok();
 
+    let nntp_config = NntpConfig::from_env()
+        .map_err(|e| panic!("Failed to load NNTP configuration from environment: {e}"))
+        .unwrap();
+
     let nntp_client = nntp_client(args.live_download, args.mock_data);
     let app_state = AppState {
         active_streams: Arc::new(Mutex::new(HashMap::new())),
         nntp_client: Arc::from(nntp_client),
         mock_mode: !args.live_download,
-        simple: Arc::new(SimpleNntpClient::new(NntpConfig::from_env().unwrap())),
+        simple: Arc::new(SimpleNntpClient::new(nntp_config)),
     };
 
     let app = Router::new()
@@ -228,7 +232,6 @@ pub async fn stream(
 pub async fn stream_chunked(
     Path(session_id): Path<Uuid>,
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<impl IntoResponse, RestError> {
     let streamer = {
         let active_streams = state.active_streams.lock().await;
@@ -371,7 +374,7 @@ async fn upload(
     let ordered_files = order_rar_files_for_download(&name_to_nzb, &match_result.matched_files);
     let fs_order: Vec<_> = ordered_files.iter().map(|(f, _)| f.path.clone()).collect();
 
-    let streamer = Arc::new(MkvStreamer::new(&fs_order).await.unwrap());
+    let streamer = Arc::new(VirtualFileStreamer::new(&fs_order).await.unwrap());
     let background = Arc::clone(&streamer);
     {
         let mut active_streams = state.active_streams.lock().await;
@@ -450,7 +453,7 @@ async fn upload_local(
     let ordered_files = order_rar_files_for_download(&name_to_nzb, &match_result.matched_files);
     let fs_order: Vec<_> = ordered_files.iter().map(|(f, _)| f.path.clone()).collect();
 
-    let streamer = Arc::new(MkvStreamer::new(&fs_order).await.unwrap());
+    let streamer = Arc::new(VirtualFileStreamer::new(&fs_order).await.unwrap());
     let background = Arc::clone(&streamer);
     {
         let mut active_streams = state.active_streams.lock().await;

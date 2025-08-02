@@ -1,5 +1,5 @@
 use crate::nntp::{config::NntpConfig, error::NntpError};
-use rek2_nntp::{authenticate, AuthenticatedConnection};
+use rek2_nntp::{AuthenticatedConnection, authenticate};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};

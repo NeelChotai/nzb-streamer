@@ -1,5 +1,5 @@
 use bytes::{Bytes, BytesMut};
-use futures::{Stream, StreamExt};
+use futures::Stream;
 use std::{
     io::{self, SeekFrom},
     path::{Path, PathBuf},
@@ -10,10 +10,9 @@ use tokio::{
     io::{AsyncReadExt, AsyncSeekExt, ReadBuf},
     sync::RwLock,
 };
-use tracing::{debug, info};
+use tracing::info;
 
-const RAR_SIGNATURE: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
-const MKV_SIGNATURE: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
+use crate::streamer::archive::analyse_rar_volume;
 
 const VIDEO_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MB chunks
 const PREFETCH_SIZE: usize = 16 * 1024 * 1024; // 16MB prefetch buffer
@@ -27,11 +26,11 @@ pub struct VolumeSegment {
     pub is_complete: bool,
 }
 
-pub struct MkvStreamer {
+pub struct VirtualFileStreamer {
     segments: Arc<RwLock<Vec<VolumeSegment>>>,
 }
 
-impl MkvStreamer {
+impl VirtualFileStreamer {
     pub async fn new(sorted_files: &[PathBuf]) -> io::Result<Self> {
         let mut segments = Vec::new();
 
@@ -90,7 +89,7 @@ impl MkvStreamer {
 
             if !gap_encountered && seg.is_complete {
                 next_virtual_start += seg.length;
-                available_bytes = next_virtual_start; // Track contiguous bytes
+                available_bytes = next_virtual_start;
             } else if !seg.is_complete {
                 // Found first gap - subsequent segments aren't contiguous
                 gap_encountered = true;
@@ -316,97 +315,4 @@ impl MkvStreamer {
 
         Ok(Bytes::from(buffer))
     }
-}
-
-async fn analyse_rar_volume(path: &Path, is_first: bool) -> io::Result<(u64, u64)> {
-    let mut file = File::open(path).await?;
-    let file_size = file.metadata().await?.len();
-
-    // Find RAR signature
-    let mut sig_buf = vec![0u8; 1024.min(file_size as usize)];
-    file.read_exact(&mut sig_buf).await?;
-
-    let rar_offset = sig_buf
-        .windows(7)
-        .position(|w| w == RAR_SIGNATURE)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No RAR signature"))?
-        as u64;
-
-    file.seek(SeekFrom::Start(rar_offset + 7)).await?;
-
-    let mut data_offset = 0;
-    let mut data_length = 0;
-
-    // Parse volume headers
-    loop {
-        // Read header CRC
-        let _ = match read_u16_le(&mut file).await {
-            Ok(v) => v,
-            Err(_) => break, // End of file
-        };
-
-        // Read header type
-        let header_type = {
-            let mut buf = [0u8; 1];
-            file.read_exact(&mut buf).await?;
-            buf[0]
-        };
-
-        let _ = read_u16_le(&mut file).await?; // flags
-        let header_size = read_u16_le(&mut file).await?;
-
-        match header_type {
-            0x73 => {
-                // MAIN_HEAD
-                file.seek(SeekFrom::Current(header_size as i64 - 7)).await?;
-            }
-            0x74 => {
-                // FILE_HEAD
-                let pack_size = read_u32_le(&mut file).await? as u64;
-                let _ = read_u32_le(&mut file).await?; // unpacked size
-
-                // Skip remaining header
-                let skip_size = header_size as i64 - 7 - 8;
-                file.seek(SeekFrom::Current(skip_size)).await?;
-
-                data_offset = file.stream_position().await?;
-                data_length = pack_size;
-
-                // For first volume, find MKV signature
-                if is_first {
-                    let mut search_buf = vec![0u8; 1024.min(pack_size as usize)];
-                    let current_pos = data_offset;
-                    file.read_exact(&mut search_buf).await?;
-
-                    if let Some(mkv_offset) = search_buf.windows(4).position(|w| w == MKV_SIGNATURE)
-                    {
-                        data_offset = current_pos + mkv_offset as u64;
-                        data_length = pack_size - mkv_offset as u64;
-                    }
-                }
-                break;
-            }
-            0x7B => {
-                // ENDARC_HEAD
-                break;
-            }
-            _ => {
-                file.seek(SeekFrom::Current(header_size as i64 - 7)).await?;
-            }
-        }
-    }
-
-    Ok((data_offset, data_length))
-}
-
-async fn read_u16_le(file: &mut File) -> io::Result<u16> {
-    let mut buf = [0u8; 2];
-    file.read_exact(&mut buf).await?;
-    Ok(u16::from_le_bytes(buf))
-}
-
-async fn read_u32_le(file: &mut File) -> io::Result<u32> {
-    let mut buf = [0u8; 4];
-    file.read_exact(&mut buf).await?;
-    Ok(u32::from_le_bytes(buf))
 }

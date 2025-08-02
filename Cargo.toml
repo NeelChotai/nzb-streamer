@@ -1,8 +1,8 @@
 [package]
 name = "nzb-streamer"
 version = "0.1.0"
-edition = "2021"
-authors = ["NZB Streamer Contributors"]
+edition = "2024"
+authors = ["Neel Chotai"]
 description = "Stream video files from Usenet NZBs without full download"
 license = "MIT"
 default-run = "nzb-streamer"
@@ -45,6 +45,7 @@ config = "0.15.13"
 backoff = { version = "0.4.0", features = ["tokio"] }
 async-stream = "0.3.6"
 md-5 = "0.10.6"
+futures-util = "0.3.31"
 
 [dev-dependencies]
 tempfile = "3"

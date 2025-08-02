@@ -1,8 +1,8 @@
 use std::path::Path;
 
+use crate::nntp::NntpClient;
 use crate::nntp::config::DownloadStatus;
 use crate::nntp::pool::ConnectionPool;
-use crate::nntp::NntpClient;
 use crate::nntp::{config::NntpConfig, error::NntpError};
 use async_trait::async_trait;
 use backoff::ExponentialBackoff;
