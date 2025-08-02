@@ -9,6 +9,7 @@ use tracing::{debug, error, info};
 
 use crate::nntp::config::NntpConfig;
 use crate::nntp::error::NntpError;
+use crate::par2::matcher::compute_hash16k_from_bytes;
 
 pub struct SimpleNntpClient {
     config: NntpConfig,
@@ -25,13 +26,14 @@ impl SimpleNntpClient {
         &self,
         file: &NzbFile,
         output_dir: &Path,
-    ) -> Result<PathBuf, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(PathBuf, Vec<u8>), Box<dyn std::error::Error + Send + Sync>> {
         if file.segments.is_empty() {
             return Err("No segments in file".into());
         }
 
         let first_segment = &file.segments[0];
         let data = self.download_segment(first_segment).await?;
+        let hash16k = compute_hash16k_from_bytes(&data);
 
         let filename = extract_filename(&file.subject);
         let output_path = output_dir.join(&filename);
@@ -39,7 +41,7 @@ impl SimpleNntpClient {
         tokio::fs::write(&output_path, &data).await?;
         debug!("Saved first segment to: {}", output_path.display());
 
-        Ok(output_path)
+        Ok((output_path, hash16k))
     }
 
     // Download first segments of multiple files concurrently and save them
@@ -47,7 +49,7 @@ impl SimpleNntpClient {
         &self,
         files: &[NzbFile],
         output_dir: &Path,
-    ) -> Result<Vec<(PathBuf, NzbFile)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<(PathBuf, NzbFile, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
         info!("Downloading first segments of {} files", files.len());
 
         let mut handles = Vec::new();
@@ -62,7 +64,7 @@ impl SimpleNntpClient {
                     .download_first_segment_to_file(&file, &output_dir)
                     .await
                 {
-                    Ok(path) => Ok((path, file)),
+                    Ok((path, bytes)) => Ok((path, file, bytes)),
                     Err(e) => {
                         error!("Failed to download first segment: {}", e);
                         Err(e)

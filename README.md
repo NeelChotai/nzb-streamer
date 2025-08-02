@@ -24,3 +24,7 @@ Stream video files directly from Usenet NZBs without downloading the entire file
 - Rust 1.75+
 - Usenet account with provider
 - NZBs with video in uncompressed RARs (store mode)
+
+## TODO
+
+- mkv streaming only works for the first segment, maybe we need to remux

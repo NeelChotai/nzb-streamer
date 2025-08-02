@@ -2,6 +2,6 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum NzbError {
-    #[error("error parsing nzb")]
+    #[error("Error parsing NZB file")]
     Parsing(#[from] nzb_rs::ParseNzbError),
 }

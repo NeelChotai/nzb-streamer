@@ -3,5 +3,6 @@ pub mod matcher;
 pub mod packet;
 pub mod par2_crc32;
 pub mod parser;
+pub mod manifest;
 
 pub use parser::FilePar2Info;

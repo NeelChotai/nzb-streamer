@@ -10,7 +10,7 @@ pub struct Nzb {
 }
 
 pub fn parse(content: &str) -> Result<Nzb, NzbError> {
-    debug!("parsing nzb");
+    debug!("Parsing NZB");
 
     let raw_nzb = RawNzb::parse(content)?;
     let (par2, rar, obfuscated) = raw_nzb.files.into_iter().fold(
@@ -23,12 +23,13 @@ pub fn parse(content: &str) -> Result<Nzb, NzbError> {
             } else if file.is_obfuscated() {
                 obf.push(file);
             }
+
             (par2, rar, obf)
         },
     );
 
     info!(
-        "successfully parsed nzb (par2: {}, rar: {}, obfuscated: {})",
+        "Successfully parsed NZB (PAR2: {}, RAR: {}, obfuscated: {})",
         par2.len(),
         rar.len(),
         obfuscated.len(),

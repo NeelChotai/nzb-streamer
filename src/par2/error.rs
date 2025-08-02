@@ -2,16 +2,16 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum Par2Error {
-    #[error("error reading par2 file")]
+    #[error("Error reading PAR2 file")]
     Io(#[from] std::io::Error),
 
-    #[error("missing main packet")]
+    #[error("Missing main packet")]
     MissingMainPacket,
 
-    #[error("received corrupted or incomplete packet")]
+    #[error("Received corrupted or incomplete packet")]
     IncompleteData,
 
-    #[error("par2 parsing error")]
+    #[error("PAR2 parsing error")]
     Parse,
 }
 
