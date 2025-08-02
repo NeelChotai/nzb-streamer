@@ -41,64 +41,6 @@ fn scan_for_packets(buffer: &[u8]) -> Vec<Packet> {
     packets
 }
 
-fn build_file_info(packets: Vec<Packet>) -> Result<HashMap<String, FilePar2Info>, Par2Error> {
-    let mut file_info: HashMap<String, FileDescPacket> = HashMap::new();
-    let mut file_crcs: HashMap<String, Vec<u32>> = HashMap::new();
-    let mut slice_size = None;
-
-    for packet in packets {
-        match packet {
-            Packet::Main(main) => slice_size = Some(main.slice_size),
-            Packet::FileDesc(desc) => {
-                file_info.insert(desc.file_id.clone(), desc);
-            }
-            Packet::IFSC(ifsc) => {
-                file_crcs.entry(ifsc.file_id).or_default().extend(ifsc.crcs);
-            }
-        }
-    }
-
-    let slice_size = slice_size.ok_or(Par2Error::MissingMainPacket)?;
-    let coeff = par2_crc32::xpow8n(slice_size);
-    let out = file_info
-        .into_iter()
-        .filter_map(|(file_id, desc)| {
-            file_crcs.get(&file_id).and_then(|crcs| {
-                (!crcs.is_empty()).then(|| {
-                    let filehash = compute_file_hash(desc.filesize, crcs, slice_size, coeff);
-                    (
-                        desc.filename.clone(),
-                        FilePar2Info {
-                            hash16k: desc.hash16k.to_vec(),
-                            filesize: desc.filesize,
-                            filehash,
-                        },
-                    )
-                })
-            })
-        })
-        .collect();
-
-    Ok(out)
-}
-
-fn compute_file_hash(filesize: u64, crcs: &[u32], slice_size: u64, coeff: u32) -> u32 {
-    let slices = (filesize / slice_size) as usize;
-    let mut crc32 = 0u32;
-
-    for &crc in crcs.iter().take(slices) {
-        crc32 = par2_crc32::multiply(crc32, coeff) ^ crc;
-    }
-
-    let tail_size = filesize % slice_size;
-    if tail_size > 0 && slices < crcs.len() {
-        let tail_crc = par2_crc32::zero_unpad(crcs[slices], slice_size - tail_size);
-        crc32 = par2_crc32::combine(crc32, tail_crc, tail_size);
-    }
-
-    crc32
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
