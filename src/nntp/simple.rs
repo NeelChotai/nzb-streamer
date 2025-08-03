@@ -9,11 +9,17 @@ use tracing::{debug, error, info};
 
 use crate::nntp::config::NntpConfig;
 use crate::nntp::error::NntpError;
-use crate::par2::matcher::compute_hash16k_from_bytes;
+use crate::par2::hash::compute_hash16k_from_bytes;
 
 pub struct SimpleNntpClient {
     config: NntpConfig,
     semaphore: Arc<Semaphore>,
+}
+
+pub struct FirstSegment {
+    pub path: PathBuf,
+    pub nzb: nzb_rs::File,
+    pub hash16k: Vec<u8>,
 }
 
 impl SimpleNntpClient {
@@ -49,22 +55,22 @@ impl SimpleNntpClient {
         &self,
         files: &[NzbFile],
         output_dir: &Path,
-    ) -> Result<Vec<(PathBuf, NzbFile, Vec<u8>)>, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<Vec<FirstSegment>, Box<dyn std::error::Error + Send + Sync>> {
         info!("Downloading first segments of {} files", files.len());
 
         let mut handles = Vec::new();
 
         for file in files {
             let client = self.clone();
-            let file = file.clone();
+            let nzb = file.clone();
             let output_dir = output_dir.to_path_buf();
 
             let handle = tokio::spawn(async move {
                 match client
-                    .download_first_segment_to_file(&file, &output_dir)
+                    .download_first_segment_to_file(&nzb, &output_dir)
                     .await
                 {
-                    Ok((path, bytes)) => Ok((path, file, bytes)),
+                    Ok((path, hash16k)) => Ok(FirstSegment { path, nzb, hash16k }),
                     Err(e) => {
                         error!("Failed to download first segment: {}", e);
                         Err(e)
@@ -91,11 +97,15 @@ impl SimpleNntpClient {
         &self,
         file: &NzbFile,
         existing_path: &Path,
+        real_path: &Path,
     ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        // rename to deobfuscated name
+        tokio::fs::rename(existing_path, real_path).await?;
+
         // Read existing data
         let mut output = OpenOptions::new()
             .append(true)
-            .open(existing_path)
+            .open(real_path)
             .await
             .unwrap();
 

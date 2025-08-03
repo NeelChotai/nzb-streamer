@@ -9,15 +9,12 @@ use axum::{
 };
 use clap::Parser;
 use http::{HeaderMap, header};
-use nzb_rs::File;
-use nzb_streamer::par2::matcher::match_files_to_par2;
+use nzb_streamer::par2;
 use serde_json::json;
-use std::time::Duration;
 use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
-use tokio::time;
 use tokio::{net::TcpListener, sync::Mutex};
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, info};
+use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use uuid::Uuid;
 
@@ -25,7 +22,6 @@ use nzb_streamer::{
     error::RestError,
     nntp::{NntpClient, client::nntp_client, config::NntpConfig, simple::SimpleNntpClient},
     nzb::{self},
-    par2::{matcher::FileMatch, parser::parse_par2_file},
     streamer::virtual_file_streamer::VirtualFileStreamer,
 };
 
@@ -96,7 +92,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/upload", post(upload))
-        .route("/local/upload", post(upload_local))
+        //.route("/local/upload", post(upload_local))
         .route("/stream/{session_id}", get(stream))
         .route("/chunked/{session_id}", get(stream_chunked))
         .route("/local/stream/{session_id}", get(stream))
@@ -327,75 +323,67 @@ async fn upload(
 
     info!("Downloading main PAR2 file");
     let par2_start = Instant::now();
-    let main_par2 = state
+    let (main_par2, _) = state
         .simple
         .download_first_segment_to_file(&nzb.par2.first().unwrap().clone(), &session_dir)
         .await
         .unwrap();
     info!("Downloaded main PAR2 file in {:?}", par2_start.elapsed());
 
-    info!("Background downloading first rar segments");
-    let rars = nzb.obfuscated.clone();
-    let client = Arc::clone(&state.simple);
-    let dir = session_dir.clone();
-    let first_segments_handle =
-        tokio::spawn(async move { client.download_first_segments_to_files(&rars, &dir).await });
+    info!("Background downloading first RAR segments");
+    let first_segments_handle = tokio::spawn({
+        let client = Arc::clone(&state.simple);
+        let dir = session_dir.clone();
+        let rars = nzb.obfuscated.clone();
+        async move { client.download_first_segments_to_files(&rars, &dir).await }
+    });
 
-    let parsed_par2 = parse_par2_file(&main_par2)?;
+    let manifest = par2::parse_file(&main_par2)?;
 
     info!("Waiting for first segment downloads to complete");
     let first_segments = first_segments_handle.await.unwrap().unwrap();
     info!("Downloaded {} first segments", first_segments.len());
 
-    let match_result = match_files_to_par2(&session_dir, &parsed_par2).unwrap();
-    info!(
-        "Matched {}/{} files",
-        match_result.matched_files.len(),
-        first_segments.len()
-    );
+    let tasks = manifest.create_download_tasks(&first_segments);
+    info!("Download tasks created: {:#?}", tasks);
 
-    if match_result.matched_files.is_empty() {
-        error!("No files matched! Check hash calculation");
+    let downloaded_hashes: Vec<_> = first_segments
+        .iter()
+        .map(|segment| segment.hash16k.clone())
+        .collect();
+    let missing = manifest.find_missing_files(&downloaded_hashes);
+    if !missing.is_empty() {
+        warn!("Missing files: {:?}", missing);
+        // TODO: Attempt PAR2 recovery for missing files
     }
 
-    let mut name_to_nzb: HashMap<String, File> = HashMap::new();
-    for file_match in &match_result.matched_files {
-        if let Some(real_name) = &file_match.real_name {
-            let obfuscated_name = file_match.path.file_name().unwrap().to_string_lossy();
-            if let Some((_, nzb_file)) = first_segments
-                .iter()
-                .find(|(path, _)| path.file_name().unwrap().to_string_lossy() == obfuscated_name)
-            {
-                name_to_nzb.insert(real_name.clone(), nzb_file.clone());
-            }
-        }
-    }
+    let paths: Vec<_> = first_segments
+        .iter()
+        .map(|segment| segment.path.clone())
+        .collect();
 
-    let ordered_files = order_rar_files_for_download(&name_to_nzb, &match_result.matched_files);
-    let fs_order: Vec<_> = ordered_files.iter().map(|(f, _)| f.path.clone()).collect();
-
-    let streamer = Arc::new(VirtualFileStreamer::new(&fs_order).await.unwrap());
-    let background = Arc::clone(&streamer);
+    let streamer = Arc::new(VirtualFileStreamer::new(&paths).await.unwrap());
     {
         let mut active_streams = state.active_streams.lock().await;
-        active_streams.insert(session_id, streamer);
+        active_streams.insert(session_id, Arc::clone(&streamer));
     }
 
     tokio::spawn(async move {
         info!(
             "Starting background download of remaining segments for {} RAR files",
-            ordered_files.len()
+            paths.len()
         );
 
-        for (file_match, nzb_file) in ordered_files {
-            // Download remaining segments
+        for task in tasks {
+            let real_path = session_dir.join(&task.real_name);
+
             state
                 .simple
-                .download_remaining_segments(&nzb_file, &file_match.path)
+                .download_remaining_segments(&task.nzb, &task.obfuscated_path, &real_path)
                 .await
                 .unwrap();
 
-            let _ = background.mark_segment_downloaded(&file_match.path).await;
+            let _ = streamer.mark_segment_downloaded(&real_path).await;
         }
 
         info!("Background download complete");
@@ -411,118 +399,78 @@ async fn upload(
     ))
 }
 
-async fn upload_local(
-    State(state): State<AppState>,
-    mut multipart: Multipart,
-) -> Result<impl IntoResponse, RestError> {
-    info!("NZB request received");
+// async fn upload_local(
+//     State(state): State<AppState>,
+//     mut multipart: Multipart,
+// ) -> Result<impl IntoResponse, RestError> {
+//     info!("NZB request received");
 
-    let mut body = None;
+//     let mut body = None;
 
-    while let Some(field) = multipart.next_field().await? {
-        if field.name() == Some("nzb") {
-            let bytes = field.bytes().await?;
-            body = Some(String::from_utf8(bytes.to_vec())?);
-            break;
-        }
-    }
+//     while let Some(field) = multipart.next_field().await? {
+//         if field.name() == Some("nzb") {
+//             let bytes = field.bytes().await?;
+//             body = Some(String::from_utf8(bytes.to_vec())?);
+//             break;
+//         }
+//     }
 
-    let content = body.ok_or_else(|| RestError::MissingNzb)?;
-    let nzb = nzb::parse(&content)?;
+//     let content = body.ok_or_else(|| RestError::MissingNzb)?;
+//     let nzb = nzb::parse(&content)?;
 
-    let session_id = Uuid::new_v4();
-    let session_dir = std::path::Path::new("/tmp/binzb/c660b3b0-eb03-420b-a213-1f564dc56096");
-    let parsed_par2 = parse_par2_file(&session_dir.join("0ae5e6761c69051d401054734c174e91.par2"))?;
-    let match_result = match_files_to_par2(session_dir, &parsed_par2).unwrap();
+//     let session_id = Uuid::new_v4();
+//     let session_dir = std::path::Path::new("/tmp/binzb/c660b3b0-eb03-420b-a213-1f564dc56096");
+//     let parsed_par2 = parse_par2_file(&session_dir.join("0ae5e6761c69051d401054734c174e91.par2"))?;
+//     let match_result = match_files_to_par2(session_dir, &parsed_par2).unwrap();
 
-    let mut name_to_nzb: HashMap<String, File> = HashMap::new();
-    for file_match in &match_result.matched_files {
-        if let Some(real_name) = &file_match.real_name {
-            let obfuscated_name = file_match.path.file_name().unwrap().to_string_lossy();
-            debug!("trying match for {}", obfuscated_name);
-            if let Some(file) = nzb
-                .obfuscated
-                .iter()
-                .find(|file| file.subject.contains(&obfuscated_name.to_string()))
-            {
-                name_to_nzb.insert(real_name.clone(), file.clone());
-            }
-        }
-    }
+//     let mut name_to_nzb: HashMap<String, File> = HashMap::new();
+//     for file_match in &match_result.matched_files {
+//         if let Some(real_name) = &file_match.real_name {
+//             let obfuscated_name = file_match.path.file_name().unwrap().to_string_lossy();
+//             debug!("trying match for {}", obfuscated_name);
+//             if let Some(file) = nzb
+//                 .obfuscated
+//                 .iter()
+//                 .find(|file| file.subject.contains(&obfuscated_name.to_string()))
+//             {
+//                 name_to_nzb.insert(real_name.clone(), file.clone());
+//             }
+//         }
+//     }
 
-    let ordered_files = order_rar_files_for_download(&name_to_nzb, &match_result.matched_files);
-    let fs_order: Vec<_> = ordered_files.iter().map(|(f, _)| f.path.clone()).collect();
+//     let ordered_files = order_rar_files_for_download(&name_to_nzb, &match_result.matched_files);
+//     let fs_order: Vec<_> = ordered_files.iter().map(|(f, _)| f.path.clone()).collect();
 
-    let streamer = Arc::new(VirtualFileStreamer::new(&fs_order).await.unwrap());
-    let background = Arc::clone(&streamer);
-    {
-        let mut active_streams = state.active_streams.lock().await;
-        active_streams.insert(session_id, streamer);
-    }
+//     let streamer = Arc::new(VirtualFileStreamer::new(&fs_order).await.unwrap());
+//     let background = Arc::clone(&streamer);
+//     {
+//         let mut active_streams = state.active_streams.lock().await;
+//         active_streams.insert(session_id, streamer);
+//     }
 
-    tokio::spawn(async move {
-        info!(
-            "Starting background download of remaining segments for {} RAR files",
-            ordered_files.len()
-        );
+//     tokio::spawn(async move {
+//         info!(
+//             "Starting background download of remaining segments for {} RAR files",
+//             ordered_files.len()
+//         );
 
-        for (file_match, _) in ordered_files {
-            let _ = background.mark_segment_downloaded(&file_match.path).await;
-            time::sleep(Duration::from_secs(100)).await;
-        }
+//         for (file_match, _) in ordered_files {
+//             let _ = background.mark_segment_downloaded(&file_match.path).await;
+//             time::sleep(Duration::from_secs(100)).await;
+//         }
 
-        info!("Background download complete");
-    });
+//         info!("Background download complete");
+//     });
 
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "session_id": session_id,
-            "message": "NZB uploaded successfully. Background processing initiated.",
-            "mode": if state.mock_mode { "mock" } else { "live" }
-        })),
-    ))
-}
-
-fn order_rar_files_for_download(
-    name_to_nzb: &HashMap<String, File>,
-    matched_files: &[FileMatch],
-) -> Vec<(FileMatch, File)> {
-    let mut files: Vec<(FileMatch, File)> = matched_files
-        .iter()
-        .filter_map(|file_match| {
-            file_match
-                .real_name
-                .as_ref()
-                .and_then(|name| name_to_nzb.get(name))
-                .map(|nzb| (file_match.clone(), nzb.clone()))
-        })
-        .collect();
-
-    files.sort_by(|a, b| {
-        let a_name = a.0.real_name.as_ref().unwrap();
-        let b_name = b.0.real_name.as_ref().unwrap();
-
-        // .rar comes first
-        if a_name.ends_with(".rar") && !b_name.ends_with(".rar") {
-            return std::cmp::Ordering::Less;
-        }
-        if !a_name.ends_with(".rar") && b_name.ends_with(".rar") {
-            return std::cmp::Ordering::Greater;
-        }
-
-        // Then .r00, .r01, etc
-        if let (Some(a_num), Some(b_num)) = (extract_rar_number(a_name), extract_rar_number(b_name))
-        {
-            return a_num.cmp(&b_num);
-        }
-
-        a_name.cmp(b_name)
-    });
-
-    debug!("sorted files: {:#?}", files);
-    files
-}
+//     Ok((
+//         StatusCode::OK,
+//         Json(json!({
+//             "session_id": session_id,
+//             "message": "NZB uploaded successfully. Background processing initiated.",
+//             "mode": if state.mock_mode { "mock" } else { "live" }
+//         })),
+//     ))
+// }
 
 // right now we match on first file
 // main par2 file might not always be first! we should use this, even just as a fallback
@@ -533,15 +481,6 @@ fn find_main_par2(par2_files: &HashMap<String, PathBuf>) -> Result<PathBuf, Rest
         .find(|(name, _)| !name.contains(".vol") && name.ends_with(".par2"))
         .map(|(_, path)| path.clone())
         .unwrap())
-}
-
-fn extract_rar_number(filename: &str) -> Option<u32> {
-    if let Some(ext) = filename.split('.').next_back() {
-        if ext.starts_with('r') && ext.len() > 1 {
-            return ext[1..].parse().ok();
-        }
-    }
-    None
 }
 
 #[cfg(test)]
