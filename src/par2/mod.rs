@@ -9,7 +9,6 @@ use crate::par2::{
 };
 
 pub mod error;
-pub mod hash;
 pub mod manifest;
 pub mod packet;
 pub mod rar;

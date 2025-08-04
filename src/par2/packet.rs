@@ -5,7 +5,7 @@ const PAR_MAIN_ID: &[u8] = b"PAR 2.0\x00Main\x00\x00\x00\x00";
 const PAR_FILE_ID: &[u8] = b"PAR 2.0\x00FileDesc";
 const PAR_SLICE_ID: &[u8] = b"PAR 2.0\x00IFSC\x00\x00\x00\x00";
 
-const HEADER_SIZE: usize = 64;
+const HEADER_SIZE: usize = 32;
 const HEADER_FIELD_SIZE: usize = 16;
 const CRC_ENTRY_SIZE: usize = 20;
 

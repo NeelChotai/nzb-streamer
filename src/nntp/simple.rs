@@ -1,3 +1,4 @@
+use md5::{Md5, Digest};
 use nzb_rs::{File as NzbFile, Segment};
 use rek2_nntp::{authenticate, body_bytes, quit};
 use std::path::{Path, PathBuf};
@@ -9,7 +10,8 @@ use tracing::{debug, error, info};
 
 use crate::nntp::config::NntpConfig;
 use crate::nntp::error::NntpError;
-use crate::par2::hash::compute_hash16k_from_bytes;
+
+const SIXTEEN_KB: usize = 16384;
 
 pub struct SimpleNntpClient {
     config: NntpConfig,
@@ -212,4 +214,10 @@ fn trim_line_endings(line: &[u8]) -> &[u8] {
         [.., b'\n'] => &line[..line.len() - 1],
         _ => line,
     }
+}
+
+pub fn compute_hash16k_from_bytes(bytes: &[u8]) -> Vec<u8> {
+    let len = bytes.len().min(SIXTEEN_KB);
+
+    Md5::new().chain_update(&bytes[..len]).finalize().to_vec()
 }
