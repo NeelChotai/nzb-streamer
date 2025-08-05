@@ -3,9 +3,8 @@ use std::{
     path::PathBuf,
 };
 
-use crate::{nntp::simple::FirstSegment, par2::rar::RarExt};
+use crate::{par2::rar::RarExt, scheduler::adaptive::FirstSegment};
 
-// par2/manifest.rs
 #[derive(Debug)]
 pub struct Par2Manifest {
     pub files: HashMap<String, FileInfo>,

@@ -33,13 +33,11 @@ impl PartialOrd for RarExt {
 }
 
 fn extract_rar_number(filename: &str) -> Option<u32> {
-    filename
-        .rsplit_once('.')
-        .and_then(|(_, ext)| {
-            ext.strip_prefix('r')
-                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
-                .and_then(|s| s.parse().ok())
-        })
+    filename.rsplit_once('.').and_then(|(_, ext)| {
+        ext.strip_prefix('r')
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            .and_then(|s| s.parse().ok())
+    })
 }
 
 #[cfg(test)]

@@ -10,7 +10,10 @@ use serde_json::json;
 use thiserror::Error;
 use tracing::error;
 
-use crate::{nzb::error::NzbError, par2::error::Par2Error};
+use crate::{
+    nntp::error::NntpError, nzb::error::NzbError, par2::error::Par2Error,
+    scheduler::error::SchedulerError,
+};
 
 #[derive(Debug, Error)]
 pub enum RestError {
@@ -37,6 +40,15 @@ pub enum RestError {
 
     #[error("Session not found")]
     SessionNotFound,
+
+    #[error("Error in NNTP client")]
+    Nntp(#[from] NntpError),
+
+    #[error("Error in background downloads")]
+    BackgroundDownload(#[from] tokio::task::JoinError),
+
+    #[error("Error in scheduler")]
+    Scheduler(#[from] SchedulerError),
 }
 
 impl IntoResponse for RestError {
@@ -52,6 +64,9 @@ impl IntoResponse for RestError {
             RestError::InvalidRange => StatusCode::BAD_REQUEST,
             RestError::RangeNotSatisfiable => StatusCode::RANGE_NOT_SATISFIABLE,
             RestError::SessionNotFound => StatusCode::NOT_FOUND,
+            RestError::Nntp(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            RestError::BackgroundDownload(_) => StatusCode::INTERNAL_SERVER_ERROR,
+            RestError::Scheduler(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
 
         let payload = Json(json!({"message": self.to_string()}));

@@ -10,8 +10,7 @@ use tracing::{debug, error, info};
 
 use crate::nntp::config::NntpConfig;
 use crate::nntp::error::NntpError;
-
-const SIXTEEN_KB: usize = 16384;
+use crate::nntp::yenc::{compute_hash16k_from_bytes, extract_filename, extract_yenc_data};
 
 pub struct SimpleNntpClient {
     config: NntpConfig,
@@ -26,7 +25,7 @@ pub struct FirstSegment {
 
 impl SimpleNntpClient {
     pub fn new(config: NntpConfig) -> Self {
-        let semaphore = Arc::new(Semaphore::new(config.max_connections.unwrap_or(40)));
+        let semaphore = Arc::new(Semaphore::new(*config.max_connections));
         Self { config, semaphore }
     }
 
@@ -42,7 +41,6 @@ impl SimpleNntpClient {
         let first_segment = &file.segments[0];
         let data = self.download_segment(first_segment).await?;
         let hash16k = compute_hash16k_from_bytes(&data);
-
         let filename = extract_filename(&file.subject);
         let output_path = output_dir.join(&filename);
 
@@ -138,13 +136,13 @@ impl SimpleNntpClient {
             &self.config.password,
         )
         .await
-        .map_err(|e| NntpError::ClientAuthentication(e.to_string()))?;
+        .map_err(|e| NntpError::Authentication(e.to_string()))?;
 
         // Download body
         let message_id = &segment.message_id;
         let bytes = body_bytes(&mut conn, &format!("<{message_id}>"))
             .await
-            .map_err(|e| NntpError::BodyRead(e.to_string()))?;
+            .map_err(|e| NntpError::Read(e.to_string()))?;
         quit(&mut conn).await.unwrap();
         let extracted = extract_yenc_data(&bytes);
         let decoded = yenc::decode_buffer(&extracted).unwrap();
@@ -166,58 +164,4 @@ impl Clone for SimpleNntpClient {
             semaphore: self.semaphore.clone(),
         }
     }
-}
-
-fn extract_filename(subject: &str) -> String {
-    // Extract filename from subject: "filename.rar" yEnc (1/1)
-    if let Some(start) = subject.find('"') {
-        if let Some(end) = subject[start + 1..].find('"') {
-            return subject[start + 1..start + 1 + end].to_string();
-        }
-    }
-    // Fallback: use first word
-    subject
-        .split_whitespace()
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
-}
-
-fn extract_yenc_data(article: &[u8]) -> Vec<u8> {
-    let mut in_body = false;
-    article
-        .split(|&b| b == b'\n')
-        .filter_map(|line| match line {
-            _ if line.starts_with(b"=ybegin") => {
-                in_body = true;
-                None
-            }
-            _ if line.starts_with(b"=ypart") => {
-                in_body = true;
-                None
-            }
-            _ if line.starts_with(b"=yend") => {
-                in_body = false;
-                None
-            }
-            _ if in_body => Some(trim_line_endings(line)),
-            _ => None,
-        })
-        .flatten()
-        .copied()
-        .collect()
-}
-
-fn trim_line_endings(line: &[u8]) -> &[u8] {
-    match line {
-        [.., b'\r', b'\n'] => &line[..line.len() - 2],
-        [.., b'\n'] => &line[..line.len() - 1],
-        _ => line,
-    }
-}
-
-pub fn compute_hash16k_from_bytes(bytes: &[u8]) -> Vec<u8> {
-    let len = bytes.len().min(SIXTEEN_KB);
-
-    Md5::new().chain_update(&bytes[..len]).finalize().to_vec()
 }

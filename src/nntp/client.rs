@@ -1,49 +1,67 @@
-use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
-use crate::nntp::config::DownloadStatus;
-use crate::nntp::live::LiveNntpClient;
-use crate::nntp::mock::MockNntpClient;
+use crate::nntp::pool::NntpPool;
+use crate::nntp::yenc::extract_yenc_data;
 use crate::nntp::{config::NntpConfig, error::NntpError};
-use async_trait::async_trait;
-use nzb_rs::{File, Segment};
-use tokio::sync::Mutex;
-use tracing::{info, warn};
+use backoff::exponential::ExponentialBackoffBuilder;
+use backoff::future::retry;
+use backoff::ExponentialBackoff;
+use bytes::Bytes;
+use nzb_rs::Segment;
+use rek2_nntp::body_bytes;
+use tracing::{debug, warn};
 
-pub fn nntp_client(
-    live: bool,
-    mock_dir: Option<std::path::PathBuf>,
-) -> Box<dyn NntpClient + Send + Sync> {
-    if live {
-        info!("Configuring live NNTP downloads");
-        let config = NntpConfig::from_env()
-            .unwrap_or_else(|err| panic!("Failed to load NNTP config: {err}"));
-        info!("NNTP configuration loaded");
-
-        Box::new(LiveNntpClient::new(config))
-    } else {
-        info!("Using mock mode - no live downloads");
-        if let Some(ref dir) = mock_dir {
-            if !dir.exists() {
-                warn!("Mock data directory doesn't exist: {}", dir.display());
-            }
-        }
-
-        Box::new(MockNntpClient::new(mock_dir))
-    }
+pub struct NntpClient {
+    pool: Arc<NntpPool>,
 }
 
-#[async_trait]
-pub trait NntpClient: Send + Sync {
-    async fn download_segment(&self, segment: &Segment) -> Result<Vec<u8>, NntpError>;
+impl NntpClient {
+    pub fn new(config: NntpConfig) -> Result<Self, NntpError> {
+        let pool = NntpPool::new(config)?;
 
-    async fn download_files_with_throttle(
-        &self,
-        files: Vec<File>,
-        output_dir: &Path,
-        status: Arc<Mutex<DownloadStatus>>,
-    ) -> Result<HashMap<String, PathBuf>, NntpError>;
+        Ok(Self {
+            pool: Arc::new(pool),
+        })
+    }
 
-    async fn download_file(&self, file: &File, output_path: &Path) -> Result<Vec<u8>, NntpError>;
+    pub async fn download(&self, segment: &Segment) -> Result<Bytes, NntpError> {
+        let backoff: ExponentialBackoff = ExponentialBackoffBuilder::new()
+            .with_max_elapsed_time(Some(Duration::from_secs(30)))
+            .build();
+
+        retry(backoff, || async {
+            match self.download_segment(segment).await {
+                Ok(data) => Ok(data),
+                Err(e) => {
+                    warn!("Download attempt failed: {}", e);
+                    Err(backoff::Error::transient(e)) // TODO: for now, some errors ARE permenant
+                }
+            }
+        })
+        .await
+    }
+
+    async fn download_segment(&self, segment: &Segment) -> Result<Bytes, NntpError> {
+        let mut conn = self.pool.get().await?;
+
+        let message_id = format!("<{}>", segment.message_id);
+        let raw_data = body_bytes(&mut conn, &message_id)
+            .await
+            .map_err(|e| NntpError::Read(e.to_string()))?; // TODO: permenant error
+
+        drop(conn); // TODO: quit logic when dropping connection (this is recycle though)
+
+        let yenc_data = extract_yenc_data(&raw_data);
+        let decoded = yenc::decode_buffer(&yenc_data).unwrap(); // TODO: permenant error
+
+        debug!(
+            "Downloaded segment {} ({} bytes raw, {} decoded)",
+            segment.message_id,
+            raw_data.len(),
+            decoded.len()
+        );
+
+        Ok(decoded.into()) // TODO: fix type constraints
+    }
 }

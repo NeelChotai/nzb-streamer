@@ -1,11 +1,13 @@
 use std::{
-    io::{self, SeekFrom},
+    io::SeekFrom,
     path::Path,
 };
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},
 };
+
+use crate::stream::error::StreamError;
 
 const RAR_SIGNATURE: [u8; 7] = [0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00];
 const MKV_SIGNATURE: [u8; 4] = [0x1A, 0x45, 0xDF, 0xA3];
@@ -14,7 +16,7 @@ const RAR_MAIN_HEAD: u8 = 0x73;
 const RAR_FILE_HEAD: u8 = 0x74;
 const RAR_ENDARC_HEAD: u8 = 0x7B;
 
-pub async fn analyse_rar_volume(path: &Path, is_first: bool) -> io::Result<(u64, u64)> {
+pub async fn analyse_rar_volume(path: &Path, is_first: bool) -> Result<(u64, u64), StreamError> {
     let mut file = File::open(path).await?;
     let file_size = file.metadata().await?.len();
 
@@ -25,7 +27,7 @@ pub async fn analyse_rar_volume(path: &Path, is_first: bool) -> io::Result<(u64,
     let rar_offset = sig_buf
         .windows(7)
         .position(|w| w == RAR_SIGNATURE)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "No RAR signature"))?
+        .ok_or_else(|| StreamError::MalformedRar(path.display().to_string()))?
         as u64;
 
     file.seek(SeekFrom::Start(rar_offset + 7)).await?;

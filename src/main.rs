@@ -10,9 +10,11 @@ use axum::{
 use clap::Parser;
 use http::{HeaderMap, header};
 use nzb_streamer::par2;
+use nzb_streamer::stream::segment_tracker::SegmentTracker;
 use serde_json::json;
-use std::{collections::HashMap, path::PathBuf, sync::Arc, time::Instant};
-use tokio::{net::TcpListener, sync::Mutex};
+use std::{collections::HashMap, path::PathBuf, sync::Arc};
+use tokio::net::TcpListener;
+use tokio::sync::RwLock;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -20,9 +22,10 @@ use uuid::Uuid;
 
 use nzb_streamer::{
     error::RestError,
-    nntp::{NntpClient, client::nntp_client, config::NntpConfig, simple::SimpleNntpClient},
+    nntp::config::NntpConfig,
     nzb::{self},
-    streamer::virtual_file_streamer::VirtualFileStreamer,
+    scheduler::adaptive::AdaptiveScheduler,
+    stream::virtual_file_streamer::VirtualFileStreamer,
 };
 
 #[derive(Parser)]
@@ -51,10 +54,15 @@ struct Args {
 }
 
 #[derive(Clone)]
+pub struct SessionData {
+    pub streamer: Arc<VirtualFileStreamer>,
+    pub tracker: Arc<SegmentTracker>,
+}
+
+#[derive(Clone)]
 pub struct AppState {
-    active_streams: Arc<Mutex<HashMap<Uuid, Arc<VirtualFileStreamer>>>>,
-    nntp_client: Arc<dyn NntpClient + Send + Sync>,
-    simple: Arc<SimpleNntpClient>,
+    sessions: Arc<RwLock<HashMap<Uuid, SessionData>>>,
+    scheduler: Arc<AdaptiveScheduler>,
     mock_mode: bool,
 }
 
@@ -78,15 +86,15 @@ async fn main() {
     dotenvy::dotenv().ok();
 
     let nntp_config = NntpConfig::from_env()
-        .map_err(|e| panic!("Failed to load NNTP configuration from environment: {e}"))
-        .unwrap();
+        .unwrap_or_else(|e| panic!("Failed to load NNTP configuration from environment: {e}"));
 
-    let nntp_client = nntp_client(args.live_download, args.mock_data);
+    let scheduler = AdaptiveScheduler::new(nntp_config)
+        .unwrap_or_else(|e| panic!("Failed to initialise scheduler: {e}"));
+
     let app_state = AppState {
-        active_streams: Arc::new(Mutex::new(HashMap::new())),
-        nntp_client: Arc::from(nntp_client),
+        sessions: Arc::new(RwLock::new(HashMap::new())),
+        scheduler: Arc::new(scheduler),
         mock_mode: !args.live_download,
-        simple: Arc::new(SimpleNntpClient::new(nntp_config)),
     };
 
     let app = Router::new()
@@ -97,14 +105,13 @@ async fn main() {
         .route("/chunked/{session_id}", get(stream_chunked))
         .route("/local/stream/{session_id}", get(stream))
         .route("/local/chunked/{session_id}", get(stream_chunked))
-        // .route("/session/{session_id}/status", get(session_status))
         .layer(CorsLayer::permissive())
         .with_state(app_state);
 
     let bind_addr = format!("{}:{}", args.host, args.port);
     let listener = TcpListener::bind(&bind_addr)
         .await
-        .unwrap_or_else(|e| panic!("failed to bind to {bind_addr}: {e}"));
+        .unwrap_or_else(|e| panic!("Failed to bind to {bind_addr}: {e}"));
 
     info!("NZB streaming server started on {}", bind_addr);
     info!("");
@@ -164,93 +171,84 @@ pub async fn stream(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, RestError> {
-    let streamer = {
-        let active_streams = state.active_streams.lock().await;
-        Arc::clone(
-            active_streams
-                .get(&session_id)
-                .ok_or(RestError::SessionNotFound)?,
-        )
-    };
+    let session = state
+        .sessions
+        .read()
+        .await
+        .get(&session_id)
+        .cloned()
+        .ok_or(RestError::SessionNotFound)?;
 
-    let available_bytes = streamer.get_available_bytes().await;
-    if available_bytes == 0 {
+    let available = session.streamer.get_available_bytes().await;
+    if available == 0 {
         return Ok(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("Retry-After", "5")
+            .header("Retry-After", "2")
             .body(Body::from("No data available yet"))
             .unwrap());
     }
 
-    let range = parse_range_header(&headers, available_bytes);
+    let range = parse_range_header(&headers, available);
+    let (start, length) = range.unwrap_or((0, available));
+    let end = start + length - 1;
 
-    if let Some((start, end)) = range {
-        let length = end - start + 1;
+    let bytes_per_segment = 1_000_000; // Estimate
+    session
+        .tracker
+        .update_playback_position(start, bytes_per_segment); // TODO: i hate this bytes shit. we should track segments.
 
-        let chunk_size = if length < MIN_CHUNK_SIZE as u64 {
-            MIN_CHUNK_SIZE
-        } else if length > MAX_CHUNK_SIZE as u64 {
-            MAX_CHUNK_SIZE
-        } else {
-            IDEAL_CHUNK_SIZE
-        };
+    let stream = session
+        .streamer
+        .read_range_with_chunk_size(start, length, IDEAL_CHUNK_SIZE); // TODO: ideal chunk size?
+    let body = Body::from_stream(stream);
 
-        let stream = streamer.read_range_with_chunk_size(start, length, chunk_size);
-        let body = Body::from_stream(stream);
+    let response = Response::builder()
+        .header(header::CONTENT_TYPE, "video/x-matroska")
+        .header(header::ACCEPT_RANGES, "bytes")
+        .header(
+            header::CONTENT_RANGE,
+            format!("bytes {start}-{end}/{available}"),
+        )
+        .header(header::CONTENT_LENGTH, length);
 
-        Ok(Response::builder()
-            .status(StatusCode::PARTIAL_CONTENT)
-            .header(header::CONTENT_TYPE, "video/x-matroska")
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(
-                header::CONTENT_RANGE,
-                format!("bytes {start}-{end}/{available_bytes}"),
-            )
-            .header(header::CONTENT_LENGTH, length)
-            .header(header::CACHE_CONTROL, "no-cache")
-            .body(body)
-            .unwrap())
-    } else {
-        let stream = streamer.read_range_with_chunk_size(0, available_bytes, MAX_CHUNK_SIZE);
-        let body = Body::from_stream(stream);
-
-        Ok(Response::builder()
+    let response = if range.is_some() {
+        response
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "video/x-matroska")
-            .header(header::ACCEPT_RANGES, "bytes")
-            .header(header::CONTENT_LENGTH, available_bytes)
             .header(header::CACHE_CONTROL, "public, max-age=3600")
-            .body(body)
-            .unwrap())
-    }
+    } else {
+        response
+            .status(StatusCode::PARTIAL_CONTENT)
+            .header(header::CACHE_CONTROL, "no-cache")
+    };
+
+    Ok(response.body(body).unwrap())
 }
 
 pub async fn stream_chunked(
     Path(session_id): Path<Uuid>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, RestError> {
-    let streamer = {
-        let active_streams = state.active_streams.lock().await;
-        Arc::clone(
-            active_streams
-                .get(&session_id)
-                .ok_or(RestError::SessionNotFound)?,
-        )
-    };
+    let streamer = state
+        .sessions
+        .read()
+        .await
+        .get(&session_id)
+        .cloned()
+        .ok_or(RestError::SessionNotFound)?
+        .streamer;
 
-    let available_bytes = streamer.get_available_bytes().await;
-
-    if available_bytes == 0 {
+    let available = streamer.get_available_bytes().await;
+    if available == 0 {
         return Ok(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
-            .header("Retry-After", "5")
+            .header("Retry-After", "2")
             .body(Body::from("No data available yet"))
             .unwrap());
     }
 
     // For chunked encoding, just stream from the beginning
     // Don't specify Content-Length at all
-    let stream = streamer.read_range_with_chunk_size(0, available_bytes, MAX_CHUNK_SIZE);
+    let stream = streamer.read_range_with_chunk_size(0, available, MAX_CHUNK_SIZE);
     let body = Body::from_stream(stream);
 
     Ok(Response::builder()
@@ -266,30 +264,38 @@ fn parse_range_header(headers: &HeaderMap, available_bytes: u64) -> Option<(u64,
     let range_header = headers.get(header::RANGE)?;
     let range_str = range_header.to_str().ok()?;
 
-    // Handle different range formats
     if let Some(range) = range_str.strip_prefix("bytes=") {
         let parts: Vec<&str> = range.split('-').collect();
 
         match parts.as_slice() {
+            // Format: "bytes=start-"
             [start, ""] => {
-                // "bytes=1024-" means from 1024 to end
                 let start = start.parse::<u64>().ok()?;
-                Some((start, available_bytes - 1))
-            }
-            ["", end] => {
-                // "bytes=-1024" means last 1024 bytes
-                let end = end.parse::<u64>().ok()?;
-                Some((available_bytes.saturating_sub(end), available_bytes - 1))
-            }
-            [start, end] => {
-                // "bytes=1024-2048" means specific range
-                let start = start.parse::<u64>().ok()?;
-                let end = end.parse::<u64>().ok()?;
-                if start <= end && end < available_bytes {
-                    Some((start, end))
-                } else {
-                    None
+                if start >= available_bytes {
+                    return None; // Unsatisfiable range
                 }
+                Some((start, available_bytes - start))
+            }
+            // Format: "bytes=-suffix"
+            ["", suffix] => {
+                let suffix_len = suffix.parse::<u64>().ok()?;
+                // Handle suffix length larger than available bytes
+                let start = available_bytes.saturating_sub(suffix_len);
+                let length = available_bytes - start;
+                if length == 0 {
+                    None // Zero-length range not allowed
+                } else {
+                    Some((start, length))
+                }
+            }
+            // Format: "bytes=start-end"
+            [start, end] => {
+                let start = start.parse::<u64>().ok()?;
+                let end = end.parse::<u64>().ok()?;
+                if start > end || end >= available_bytes {
+                    return None; // Invalid range
+                }
+                Some((start, end - start + 1))
             }
             _ => None,
         }
@@ -304,17 +310,19 @@ async fn upload(
 ) -> Result<impl IntoResponse, RestError> {
     info!("NZB request received");
 
-    let mut body = None;
+    let content = {
+        let mut body = None;
 
-    while let Some(field) = multipart.next_field().await? {
-        if field.name() == Some("nzb") {
-            let bytes = field.bytes().await?;
-            body = Some(String::from_utf8(bytes.to_vec())?);
-            break;
+        while let Some(field) = multipart.next_field().await? {
+            if field.name() == Some("nzb") {
+                let bytes = field.bytes().await?;
+                body = Some(String::from_utf8(bytes.to_vec())?);
+                break;
+            }
         }
-    }
 
-    let content = body.ok_or_else(|| RestError::MissingNzb)?;
+        body.ok_or_else(|| RestError::MissingNzb)?
+    };
     let nzb = nzb::parse(&content)?;
 
     let session_id = Uuid::new_v4();
@@ -322,30 +330,32 @@ async fn upload(
     tokio::fs::create_dir_all(&session_dir).await.unwrap();
 
     info!("Downloading main PAR2 file");
-    let par2_start = Instant::now();
-    let (main_par2, _) = state
-        .simple
-        .download_first_segment_to_file(&nzb.par2.first().unwrap().clone(), &session_dir)
+    // TODO: this operates on the assumption that the par2 file is one segment
+    let par2_target = nzb.par2.first().unwrap().clone();
+    let main_par2 = state
+        .scheduler
+        .download_first_segment(par2_target, &session_dir)
         .await
         .unwrap();
-    info!("Downloaded main PAR2 file in {:?}", par2_start.elapsed());
 
     info!("Background downloading first RAR segments");
-    let first_segments_handle = tokio::spawn({
-        let client = Arc::clone(&state.simple);
+    let first_segments = tokio::spawn({
+        let scheduler = Arc::clone(&state.scheduler);
         let dir = session_dir.clone();
         let rars = nzb.obfuscated.clone();
-        async move { client.download_first_segments_to_files(&rars, &dir).await }
+        async move {
+            scheduler.download_first_segments(&rars, &dir).await // TODO: handle files that are actually rar
+        }
     });
 
-    let manifest = par2::parse_file(&main_par2)?;
+    let manifest = par2::parse_file(&main_par2.path)?; // TODO: wasteful to write in download_first_segment, then immediately read here
 
     info!("Waiting for first segment downloads to complete");
-    let first_segments = first_segments_handle.await.unwrap().unwrap();
+    let first_segments = first_segments.await??;
     info!("Downloaded {} first segments", first_segments.len());
 
     let tasks = manifest.create_download_tasks(&first_segments);
-    info!("Download tasks created: {:#?}", tasks);
+    info!("Created {} download tasks", tasks.len());
 
     let downloaded_hashes: Vec<_> = first_segments
         .iter()
@@ -363,30 +373,30 @@ async fn upload(
         .collect();
 
     let streamer = Arc::new(VirtualFileStreamer::new(&paths).await.unwrap());
-    {
-        let mut active_streams = state.active_streams.lock().await;
-        active_streams.insert(session_id, Arc::clone(&streamer));
-    }
+    let tracker = Arc::new(SegmentTracker::new());
+    state.sessions.write().await.insert(
+        session_id,
+        SessionData {
+            streamer: streamer.clone(),
+            tracker: tracker.clone(),
+        },
+    );
 
-    tokio::spawn(async move {
-        info!(
-            "Starting background download of remaining segments for {} RAR files",
-            paths.len()
-        );
+    tokio::spawn({
+        let scheduler = Arc::clone(&state.scheduler);
+        async move {
+            info!(
+                "Starting background download of remaining segments for {} RAR files",
+                paths.len()
+            );
 
-        for task in tasks {
-            let real_path = session_dir.join(&task.real_name);
-
-            state
-                .simple
-                .download_remaining_segments(&task.nzb, &task.obfuscated_path, &real_path)
+            scheduler
+                .schedule_downloads(tasks, &session_dir, session_id, streamer, tracker)
                 .await
                 .unwrap();
 
-            let _ = streamer.mark_segment_downloaded(&real_path).await;
+            info!("Background download complete");
         }
-
-        info!("Background download complete");
     });
 
     Ok((

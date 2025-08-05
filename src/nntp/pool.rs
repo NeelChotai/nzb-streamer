@@ -1,54 +1,94 @@
+use crate::nntp::error::NntpPoolError;
 use crate::nntp::{config::NntpConfig, error::NntpError};
+use deadpool::Runtime;
+use deadpool::managed::{Manager, Metrics, Pool, PoolConfig, QueueMode, RecycleResult, Timeouts};
 use rek2_nntp::{AuthenticatedConnection, authenticate};
-use std::sync::Arc;
-use tokio::sync::Mutex;
-use tracing::{debug, warn};
+use shrinkwraprs::Shrinkwrap;
+use std::{sync::Arc, time::Duration};
+use tokio::time;
+use tracing::{debug, info, warn};
 
-pub struct ConnectionPool {
+pub struct Connection {
     config: NntpConfig,
-    connections: Arc<Mutex<Vec<AuthenticatedConnection>>>,
-    max_connections: usize,
 }
 
-impl ConnectionPool {
-    pub fn new(config: NntpConfig) -> Self {
-        let max_connections = config.max_connections.unwrap_or_else(|| {
-            warn!("Max connections not provided. Using default (40)");
-            40
-        });
+impl Manager for Connection {
+    type Type = AuthenticatedConnection;
+    type Error = NntpPoolError;
 
-        Self {
-            config,
-            connections: Arc::new(Mutex::new(Vec::new())),
-            max_connections,
-        }
+    async fn create(&self) -> Result<Self::Type, Self::Error> {
+        debug!("Creating new NNTP connection to {}", self.config.host);
+
+        let conn = authenticate(
+            &self.config.host,
+            &self.config.username,
+            &self.config.password,
+        )
+        .await
+        .map_err(|e| NntpPoolError::Authentication(e.to_string()))?;
+
+        Ok(conn)
     }
 
-    pub async fn get_connection(&self) -> Result<AuthenticatedConnection, NntpError> {
-        let mut pool = self.connections.lock().await;
+    async fn recycle(
+        &self,
+        _conn: &mut Self::Type,
+        _metrics: &Metrics,
+    ) -> RecycleResult<Self::Error> {
+        // Could send NOOP here to check health
+        Ok(())
+    }
+}
 
-        if let Some(conn) = pool.pop() {
-            debug!("Reusing connection from pool");
-            Ok(conn)
-        } else {
-            debug!("Creating new NNTP connection");
-            authenticate(
-                &self.config.host,
-                &self.config.username,
-                &self.config.password,
-            )
-            .await
-            .map_err(|e| NntpError::ClientAuthentication(e.to_string()))
-        }
+#[derive(Shrinkwrap)]
+pub struct NntpPool(pub Pool<Connection>);
+
+impl NntpPool {
+    pub fn new(config: NntpConfig) -> Result<Self, NntpError> {
+        let connection = Connection {
+            config: config.clone(),
+        };
+
+        let pool_config = PoolConfig {
+            max_size: *config.max_connections,
+            timeouts: Timeouts {
+                wait: None, // Block forever - caller shouldn't care about pool state
+                create: Some(Duration::from_secs(5)), // TODO: revisit
+                recycle: Some(*config.idle_timeout),
+            },
+            queue_mode: QueueMode::default(),
+        };
+
+        let pool = Pool::builder(connection)
+            .config(pool_config)
+            .runtime(Runtime::Tokio1)
+            .build()?;
+
+        Ok(NntpPool(pool))
     }
 
-    pub async fn return_connection(&self, conn: AuthenticatedConnection) {
-        let mut pool = self.connections.lock().await;
-        if pool.len() < self.max_connections {
-            pool.push(conn);
-            debug!("Returned connection to pool");
-        } else {
-            debug!("Pool full, dropping connection");
+    pub async fn warm_pool(self: Arc<Self>) {
+        let target = *self.0.manager().config.max_connections;
+        info!("Pre-warming connection pool with {} connections", target);
+
+        for i in 0..target {
+            tokio::spawn({
+                let client = Arc::clone(&self);
+                async move {
+                    time::sleep(Duration::from_millis(i as u64 * 50)).await;
+
+                    match client.0.get().await {
+                        Ok(_) => {
+                            debug!("Pre-warmed connection {}", i);
+                        }
+                        Err(e) => {
+                            warn!("Failed to pre-warm connection {}: {}", i, e);
+                        }
+                    };
+                }
+            });
         }
+
+        info!("Connection pool warmed");
     }
 }

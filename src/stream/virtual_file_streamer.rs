@@ -12,7 +12,7 @@ use tokio::{
 };
 use tracing::info;
 
-use crate::streamer::archive::analyse_rar_volume;
+use crate::stream::{archive::analyse_rar_volume, error::StreamError};
 
 const VIDEO_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MB chunks
 const PREFETCH_SIZE: usize = 16 * 1024 * 1024; // 16MB prefetch buffer
@@ -31,7 +31,7 @@ pub struct VirtualFileStreamer {
 }
 
 impl VirtualFileStreamer {
-    pub async fn new(sorted_files: &[PathBuf]) -> io::Result<Self> {
+    pub async fn new(sorted_files: &[PathBuf]) -> Result<Self, StreamError> {
         let mut segments = Vec::new();
 
         for path in sorted_files.iter() {
@@ -65,7 +65,7 @@ impl VirtualFileStreamer {
         available
     }
 
-    pub async fn mark_segment_downloaded(&self, path: &Path) -> io::Result<()> {
+    pub async fn mark_segment_downloaded(&self, path: &Path) -> Result<(), StreamError> {
         let mut segments = self.segments.write().await;
         let segment_idx = segments
             .iter()
@@ -105,7 +105,7 @@ impl VirtualFileStreamer {
         Ok(())
     }
 
-    pub fn stream(self) -> impl Stream<Item = io::Result<Bytes>> + 'static {
+    pub fn stream(self) -> impl Stream<Item = Result<Bytes, StreamError>> {
         async_stream::try_stream! {
             let streamer = self.segments.read().await.clone();
 
@@ -139,7 +139,7 @@ impl VirtualFileStreamer {
         &self,
         start: u64,
         length: u64,
-    ) -> impl Stream<Item = io::Result<Bytes>> + Send + 'static {
+    ) -> impl Stream<Item = Result<Bytes, StreamError>> {
         let segments = Arc::clone(&self.segments);
         let end = start + length;
 
@@ -217,7 +217,7 @@ impl VirtualFileStreamer {
         start: u64,
         length: u64,
         chunk_size: usize,
-    ) -> impl Stream<Item = io::Result<Bytes>> + Send + 'static {
+    ) -> impl Stream<Item = Result<Bytes, StreamError>> + 'static {
         let segments = Arc::clone(&self.segments);
         let end = start + length;
 
@@ -293,8 +293,7 @@ impl VirtualFileStreamer {
         }
     }
 
-    // Optimized method for seeking within the video
-    pub async fn read_at(&self, offset: u64, length: u64) -> io::Result<Bytes> {
+    pub async fn read_at(&self, offset: u64, length: u64) -> Result<Bytes, StreamError> {
         // Find the segment
         let segment = self.segments.read().await;
 

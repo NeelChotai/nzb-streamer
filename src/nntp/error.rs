@@ -1,28 +1,27 @@
+use std::io;
+
 use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum NntpError {
-    #[error("error reading config from environment")]
+    #[error("Error reading config from environment")]
     Config(#[from] config::ConfigError),
 
-    #[error("client authentication error: {0}")]
-    ClientAuthentication(String),
+    #[error("Error reading body: {0}")]
+    Read(String),
 
-    #[error("error reading body: {0}")]
-    BodyRead(String),
+    #[error("I/O error")]
+    Io(#[from] io::Error),
 
-    #[error("connection pool error: {0}")]
-    ConnectionPool(String),
+    #[error("Error constructing pool")]
+    CreatePool(#[from] deadpool::managed::BuildError),
 
-    #[error("segment download failed: {0}")]
-    SegmentDownload(String),
+    #[error("Error constructing pool")]
+    AcquirePool(#[from] deadpool::managed::PoolError<NntpPoolError>),
+}
 
-    #[error("timeout error: {0}")]
-    Timeout(String),
-
-    #[error("network error: {0}")]
-    Network(String),
-
-    #[error("Bandwidth limiter error")]
-    Bandwidth,
+#[derive(Error, Debug)]
+pub enum NntpPoolError {
+    #[error("Authentication error: {0}")]
+    Authentication(String),
 }
