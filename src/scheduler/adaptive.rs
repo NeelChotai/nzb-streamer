@@ -5,6 +5,7 @@ use crate::par2::manifest::DownloadTask;
 use crate::scheduler::batch::{self, BatchGenerator, Priority};
 use crate::scheduler::{error::SchedulerError, queue::FileQueue, writer::FileWriterPool};
 use crate::stream::orchestrator::{BufferHealth, StreamOrchestrator};
+use bytes::Bytes;
 use dashmap::DashMap;
 use futures::future::join_all;
 use futures::stream::{self, StreamExt};
@@ -23,7 +24,7 @@ pub struct AdaptiveScheduler {
 pub struct FirstSegment {
     pub path: PathBuf,
     pub nzb: nzb_rs::File,
-    pub hash16k: Vec<u8>,
+    pub hash16k: Bytes,
 }
 
 impl AdaptiveScheduler {
@@ -34,6 +35,10 @@ impl AdaptiveScheduler {
             client: Arc::new(client),
             max_workers: *config.max_connections,
         })
+    }
+
+    pub async fn warm_pool(&self) {
+        self.client.warm_pool().await
     }
 
     pub async fn download_first_segments(
@@ -72,40 +77,33 @@ impl AdaptiveScheduler {
         Ok(FirstSegment {
             path,
             nzb: file,
-            hash16k,
+            hash16k: hash16k.into(),
         })
     }
 
     pub async fn schedule_downloads(
         &self,
         tasks: Vec<DownloadTask>,
-        session_dir: &Path,
         session_id: Uuid,
         orchastrator: Arc<StreamOrchestrator>,
     ) -> Result<(), SchedulerError> {
         info!("Starting adaptive download for session {}", session_id);
 
-        let session = self.prepare_session(tasks, session_dir).await?;
+        let session = self.prepare_session(tasks).await?;
         self.process_batches(session, orchastrator).await?;
 
         info!("Download complete for session {}", session_id);
         Ok(())
     }
 
-    async fn prepare_session(
-        &self,
-        tasks: Vec<DownloadTask>,
-        session_dir: &Path,
-    ) -> Result<Session, SchedulerError> {
+    async fn prepare_session(&self, tasks: Vec<DownloadTask>) -> Result<Session, SchedulerError> {
         let writers = FileWriterPool::new();
         let file_queues = stream::iter(tasks)
             .then(|task| {
                 let writers = &writers;
                 async move {
-                    let real_path = session_dir.join(&task.real_name);
-                    tokio::fs::rename(&task.obfuscated_path, &real_path).await?;
-                    writers.add_file(&real_path).await?;
-                    FileQueue::new(task, real_path)
+                    writers.add_file(&task.path).await?;
+                    FileQueue::new(task)
                 }
             })
             .collect::<Vec<_>>()
@@ -130,7 +128,7 @@ impl AdaptiveScheduler {
             session
                 .file_queues
                 .iter()
-                .map(|q| (q.path().clone(), q.total_segments())),
+                .map(|q| (q.path().clone(), (q.total_segments(), 1))), // TODO: first segment done, is this the right place to put this?
         ));
 
         let workers = (0..self.max_workers)
@@ -146,8 +144,8 @@ impl AdaptiveScheduler {
             })
             .collect::<Vec<_>>();
 
-        let generator = BatchGenerator::new(session.file_queues, self.max_workers)
-            .into_iter_with_orchestrator(orchestrator.clone());
+        let generator =
+            BatchGenerator::new(session.file_queues, self.max_workers, orchestrator.clone());
 
         for batch in generator {
             debug!(
@@ -161,7 +159,7 @@ impl AdaptiveScheduler {
             }
 
             // Adaptive backpressure
-            match orchestrator.get_buffer_health().await {
+            match orchestrator.get_buffer_health() {
                 BufferHealth::Critical => {
                     // Prioritise playback area
                     while tx.len() > 1 {
@@ -203,7 +201,7 @@ fn spawn_worker(
     client: Arc<NntpClient>,
     writers: FileWriterPool,
     orchestrator: Arc<StreamOrchestrator>,
-    file_segments: Arc<DashMap<PathBuf, usize>>,
+    file_segments: Arc<DashMap<PathBuf, (usize, usize)>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         debug!("Worker {} started", id);
@@ -213,18 +211,17 @@ fn spawn_worker(
                 Ok(_) => {
                     let path = job.path().clone();
                     let mut should_notify = false;
-                    
+
                     if let Some(mut entry) = file_segments.get_mut(&path) {
                         entry.1 += 1; // Increment completed
-                        debug!("File {} progress: {}/{}", 
-                               path.display(), entry.1, entry.0);
-                        
+                        debug!("File {} progress: {}/{}", path.display(), entry.1, entry.0);
+
                         if entry.1 == entry.0 {
                             should_notify = true;
                             info!("File {} fully downloaded", path.display());
                         }
                     }
-                    
+
                     // Notify orchestrator only when file is complete
                     if should_notify {
                         if let Err(e) = orchestrator.mark_file_complete(&path).await {
@@ -237,7 +234,7 @@ fn spawn_worker(
                 }
             }
         }
-        
+
         debug!("Worker {} finished", id);
     })
 }
@@ -246,23 +243,8 @@ async fn process_job(
     job: &batch::Job,
     client: &NntpClient,
     writers: &FileWriterPool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<(), SchedulerError> {
     let data = client.download(job.segment()).await?;
     writers.write(job.path(), job.index(), data).await?;
     Ok(())
 }
-
-// Extension for BatchGenerator to work with orchestrator
-// impl BatchGenerator {
-//     pub fn into_iter_with_orchestrator(
-//         self,
-//         orchestrator: Arc<StreamOrchestrator>,
-//     ) -> impl Iterator<Item = Batch> {
-//         // Get priority index from orchestrator
-//         let priority_file = orchestrator.get_priority_index();
-        
-//         // The BatchGenerator should prioritise files near the priority index
-//         // This would be implemented in the BatchGenerator itself
-//         self.into_iter()
-//     }
-// }

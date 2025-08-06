@@ -32,7 +32,7 @@ pub fn parse_buffer(buffer: &[u8]) -> Result<Par2Manifest, Par2Error> {
                     desc.filename.clone(),
                     FileInfo {
                         real_filename: desc.filename,
-                        hash16k: desc.hash16k,
+                        hash16k: desc.hash16k.into(),
                     },
                 );
             }

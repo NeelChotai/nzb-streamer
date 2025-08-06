@@ -10,7 +10,8 @@ use backoff::future::retry;
 use bytes::Bytes;
 use nzb_rs::Segment;
 use rek2_nntp::body_bytes;
-use tracing::{debug, warn};
+use tokio::time;
+use tracing::{debug, info, warn};
 
 pub struct NntpClient {
     pool: Arc<NntpPool>,
@@ -23,6 +24,31 @@ impl NntpClient {
         Ok(Self {
             pool: Arc::new(pool),
         })
+    }
+
+    pub async fn warm_pool(&self) {
+        let target = 20; // TODO: hardcoded for now
+        info!("Pre-warming connection pool with {} connections", target);
+
+        for i in 0..target {
+            tokio::spawn({
+                let client = Arc::clone(&self.pool);
+                async move {
+                    time::sleep(Duration::from_millis(i as u64 * 50)).await;
+
+                    match client.0.get().await {
+                        Ok(_) => {
+                            debug!("Pre-warmed connection {}", i);
+                        }
+                        Err(e) => {
+                            warn!("Failed to pre-warm connection {}: {}", i, e);
+                        }
+                    };
+                }
+            });
+        }
+
+        info!("Connection pool warmed");
     }
 
     pub async fn download(&self, segment: &Segment) -> Result<Bytes, NntpError> {

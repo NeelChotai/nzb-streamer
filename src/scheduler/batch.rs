@@ -1,5 +1,6 @@
 use crate::scheduler::queue::FileQueue;
-use crate::stream::orchestrator::{self, BufferHealth, StreamOrchestrator};
+use crate::stream::orchestrator::{BufferHealth, StreamOrchestrator};
+use derive_more::Constructor;
 use nzb_rs::Segment;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -54,25 +55,16 @@ pub struct Batch {
     pub priority: Priority,
 }
 
+#[derive(Debug, Constructor)]
 pub struct BatchGenerator {
     files: Vec<FileQueue>,
-    wave_size: usize,
+    batch_size: usize,
+    orchestrator: Arc<StreamOrchestrator>,
 }
 
 impl BatchGenerator {
-    pub fn new(files: Vec<FileQueue>, wave_size: usize) -> Self {
-        Self { files, wave_size }
-    }
-
-    pub async fn into_iter_with_orchestrator(
-        self,
-        orchastrator: Arc<StreamOrchestrator>,
-    ) -> BatchIterator<impl Fn() -> Priority> {
-        let priority_fn = move async || orchastrator.get_buffer_health().await.into();
-        BatchIterator {
-            generator: self,
-            priority_fn,
-        }
+    fn determine_priority(&self) -> Priority {
+        self.orchestrator.get_buffer_health().into()
     }
 
     fn generate_batch(&mut self, priority: Priority) -> Option<Batch> {
@@ -89,13 +81,13 @@ impl BatchGenerator {
         self.files
             .iter_mut()
             .find(|f| !f.is_empty())
-            .map(|f| f.take(self.wave_size))
+            .map(|f| f.take(self.batch_size))
             .unwrap_or_default()
     }
 
     fn take_balanced(&mut self) -> Vec<Job> {
         const FILES_PER_WAVE: usize = 3;
-        let per_file = self.wave_size / FILES_PER_WAVE;
+        let per_file = self.batch_size / FILES_PER_WAVE;
 
         let jobs: Vec<_> = self
             .files
@@ -105,8 +97,8 @@ impl BatchGenerator {
             .flat_map(|f| f.take(per_file))
             .collect();
 
-        if jobs.len() < self.wave_size / 2 {
-            let remaining = self.wave_size - jobs.len();
+        if jobs.len() < self.batch_size / 2 {
+            let remaining = self.batch_size - jobs.len();
             let extra: Vec<_> = self
                 .files
                 .iter_mut()
@@ -125,12 +117,21 @@ impl BatchGenerator {
             return Vec::new();
         }
 
-        let per_file = (self.wave_size / active).max(1);
+        let per_file = (self.batch_size / active).max(1);
         self.files
             .iter_mut()
             .filter(|f| !f.is_empty())
             .flat_map(|f| f.take(per_file))
             .collect()
+    }
+}
+
+impl Iterator for BatchGenerator {
+    type Item = Batch;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let priority = self.determine_priority();
+        self.generate_batch(priority)
     }
 }
 

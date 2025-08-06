@@ -8,6 +8,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::mpsc;
 use tracing::{error, info};
 
+use crate::scheduler::error::SchedulerError;
+
 #[derive(Clone)]
 pub struct FileWriterPool {
     writers: Arc<DashMap<PathBuf, mpsc::Sender<(usize, Bytes)>>>,
@@ -26,7 +28,7 @@ impl FileWriterPool {
         }
     }
 
-    pub async fn add_file(&self, path: &Path) -> Result<(), std::io::Error> {
+    pub async fn add_file(&self, path: &Path) -> Result<(), SchedulerError> {
         let (tx, rx) = mpsc::channel(100);
         self.writers.insert(path.to_owned(), tx);
 
@@ -45,10 +47,10 @@ impl FileWriterPool {
         path: &Path,
         index: usize,
         data: Bytes,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    ) -> Result<(), SchedulerError> {
         self.writers
             .get(path)
-            .ok_or("No writer for path")?
+            .ok_or_else(|| SchedulerError::FileNotFound(path.to_path_buf()))?
             .send((index, data))
             .await?;
         Ok(())

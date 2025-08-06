@@ -1,3 +1,6 @@
+use std::path::PathBuf;
+
+use bytes::Bytes;
 use thiserror::Error;
 
 use crate::{nntp::error::NntpError, scheduler::batch::Job};
@@ -11,11 +14,14 @@ pub enum SchedulerError {
     Io(#[from] std::io::Error),
 
     #[error("Error in channel communication on write")]
-    Write(#[from] tokio::sync::mpsc::error::SendError<(usize, Vec<u8>)>),
+    Write(#[from] tokio::sync::mpsc::error::SendError<(usize, Bytes)>),
 
     #[error("Error in channel communication during job dispatch")]
     Dispatch(#[from] async_channel::SendError<Job>),
 
     #[error("File '{0}' contained no subjects, source NZB may be malformed")]
     EmptyFile(String),
+
+    #[error("Tried to write file to path '{0}', but does not exist")]
+    FileNotFound(PathBuf),
 }

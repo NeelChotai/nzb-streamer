@@ -9,8 +9,11 @@ use axum::{
 };
 use clap::Parser;
 use http::{HeaderMap, header};
+use nzb_streamer::nntp::yenc::extract_filename;
+use nzb_streamer::nzb::Nzb;
 use nzb_streamer::par2;
-use nzb_streamer::stream::segment_tracker::SegmentTracker;
+use nzb_streamer::par2::manifest::DownloadTask;
+use nzb_streamer::stream::orchestrator::StreamOrchestrator;
 use serde_json::json;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
@@ -25,7 +28,6 @@ use nzb_streamer::{
     nntp::config::NntpConfig,
     nzb::{self},
     scheduler::adaptive::AdaptiveScheduler,
-    stream::virtual_file_streamer::VirtualFileStreamer,
 };
 
 #[derive(Parser)]
@@ -54,19 +56,12 @@ struct Args {
 }
 
 #[derive(Clone)]
-pub struct SessionData {
-    pub streamer: Arc<VirtualFileStreamer>,
-    pub tracker: Arc<SegmentTracker>,
-}
-
-#[derive(Clone)]
 pub struct AppState {
-    sessions: Arc<RwLock<HashMap<Uuid, SessionData>>>,
+    sessions: Arc<RwLock<HashMap<Uuid, Arc<StreamOrchestrator>>>>,
     scheduler: Arc<AdaptiveScheduler>,
     mock_mode: bool,
 }
 
-const MIN_CHUNK_SIZE: usize = 2 * 1024 * 1024; // 2MB minimum
 const IDEAL_CHUNK_SIZE: usize = 8 * 1024 * 1024; // 8MB ideal
 const MAX_CHUNK_SIZE: usize = 16 * 1024 * 1024; // 16MB maximum
 
@@ -90,6 +85,8 @@ async fn main() {
 
     let scheduler = AdaptiveScheduler::new(nntp_config)
         .unwrap_or_else(|e| panic!("Failed to initialise scheduler: {e}"));
+
+    scheduler.warm_pool().await; // TODO: make this better?
 
     let app_state = AppState {
         sessions: Arc::new(RwLock::new(HashMap::new())),
@@ -171,15 +168,12 @@ pub async fn stream(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, RestError> {
-    let session = state
-        .sessions
-        .read()
-        .await
+    let sessions = state.sessions.read().await;
+    let orchestrator = sessions
         .get(&session_id)
-        .cloned()
         .ok_or(RestError::SessionNotFound)?;
 
-    let available = session.streamer.get_available_bytes().await;
+    let available = orchestrator.get_available_bytes();
     if available == 0 {
         return Ok(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -192,9 +186,9 @@ pub async fn stream(
     let (start, length) = range.unwrap_or((0, available));
     let end = start + length - 1;
 
-    let stream = session
-        .streamer
-        .read_range_with_chunk_size(start, length, IDEAL_CHUNK_SIZE); // TODO: ideal chunk size?
+    let stream = orchestrator
+        .get_stream(start, length, IDEAL_CHUNK_SIZE)
+        .await; // TODO: ideal chunk size?
     let body = Body::from_stream(stream);
 
     let response = Response::builder()
@@ -223,16 +217,12 @@ pub async fn stream_chunked(
     Path(session_id): Path<Uuid>,
     State(state): State<AppState>,
 ) -> Result<impl IntoResponse, RestError> {
-    let streamer = state
-        .sessions
-        .read()
-        .await
+    let sessions = state.sessions.read().await;
+    let orchestrator = sessions
         .get(&session_id)
-        .cloned()
-        .ok_or(RestError::SessionNotFound)?
-        .streamer;
+        .ok_or(RestError::SessionNotFound)?;
 
-    let available = streamer.get_available_bytes().await;
+    let available = orchestrator.get_available_bytes();
     if available == 0 {
         return Ok(Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
@@ -243,7 +233,7 @@ pub async fn stream_chunked(
 
     // For chunked encoding, just stream from the beginning
     // Don't specify Content-Length at all
-    let stream = streamer.read_range_with_chunk_size(0, available, MAX_CHUNK_SIZE);
+    let stream = orchestrator.get_stream(0, available, MAX_CHUNK_SIZE).await;
     let body = Body::from_stream(stream);
 
     Ok(Response::builder()
@@ -325,12 +315,61 @@ async fn upload(
     let session_dir = std::path::Path::new("/tmp/binzb").join(session_id.to_string());
     tokio::fs::create_dir_all(&session_dir).await.unwrap();
 
+    let tasks = if !nzb.obfuscated.is_empty() {
+        info!("NZB contains obfuscated files, decoding");
+        obfuscated(nzb, &state, &session_dir).await
+    } else {
+        info!("NZB contains plain RAR files, serving");
+        plain(nzb, &session_dir)
+    }?;
+
+    let paths: Vec<_> = tasks.iter().map(|segment| segment.path.clone()).collect();
+
+    let orchestrator = Arc::new(StreamOrchestrator::new(&paths).await.unwrap());
+    state
+        .sessions
+        .write()
+        .await
+        .insert(session_id, orchestrator.clone());
+
+    tokio::spawn({
+        let scheduler = Arc::clone(&state.scheduler);
+        async move {
+            info!(
+                "Starting background download of remaining segments for {} RAR files",
+                paths.len()
+            );
+
+            scheduler
+                .schedule_downloads(tasks, session_id, orchestrator)
+                .await
+                .unwrap();
+
+            info!("Background download complete");
+        }
+    });
+
+    Ok((
+        StatusCode::OK,
+        Json(json!({
+            "session_id": session_id,
+            "message": "NZB uploaded successfully. Background processing initiated.",
+            "mode": if state.mock_mode { "mock" } else { "live" }
+        })),
+    ))
+}
+
+async fn obfuscated(
+    nzb: Nzb,
+    state: &AppState,
+    session_dir: &PathBuf,
+) -> Result<Vec<DownloadTask>, RestError> {
     info!("Downloading main PAR2 file");
     // TODO: this operates on the assumption that the par2 file is one segment
     let par2_target = nzb.par2.first().unwrap().clone();
     let main_par2 = state
         .scheduler
-        .download_first_segment(par2_target, &session_dir)
+        .download_first_segment(par2_target, session_dir)
         .await
         .unwrap();
 
@@ -363,48 +402,22 @@ async fn upload(
         // TODO: Attempt PAR2 recovery for missing files
     }
 
-    let paths: Vec<_> = first_segments
+    Ok(tasks)
+}
+
+fn plain(nzb: Nzb, session_dir: &PathBuf) -> Result<Vec<DownloadTask>, RestError> {
+    info!("Background downloading RAR files");
+    let tasks: Vec<_> = nzb
+        .rar
         .iter()
-        .map(|segment| segment.path.clone())
+        .map(|file| DownloadTask {
+            path: session_dir.join(extract_filename(&file.subject)),
+            nzb: file.clone(),
+        })
         .collect();
+    info!("Created {} download tasks", tasks.len());
 
-    let streamer = Arc::new(VirtualFileStreamer::new(&paths).await.unwrap());
-    let tracker = Arc::new(SegmentTracker::new());
-    state.sessions.write().await.insert(
-        session_id,
-        SessionData {
-            streamer: streamer.clone(),
-            tracker: tracker.clone(),
-        },
-    );
-
-    tokio::spawn({
-        let scheduler = Arc::clone(&state.scheduler);
-        async move {
-            info!(
-                "Starting background download of remaining segments for {} RAR files",
-                paths.len()
-            );
-
-            
-
-            scheduler
-                .schedule_downloads(tasks, &session_dir, session_id, streamer, tracker)
-                .await
-                .unwrap();
-
-            info!("Background download complete");
-        }
-    });
-
-    Ok((
-        StatusCode::OK,
-        Json(json!({
-            "session_id": session_id,
-            "message": "NZB uploaded successfully. Background processing initiated.",
-            "mode": if state.mock_mode { "mock" } else { "live" }
-        })),
-    ))
+    Ok(tasks)
 }
 
 // async fn upload_local(

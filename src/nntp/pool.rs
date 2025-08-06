@@ -4,9 +4,8 @@ use deadpool::Runtime;
 use deadpool::managed::{Manager, Metrics, Pool, PoolConfig, QueueMode, RecycleResult, Timeouts};
 use rek2_nntp::{AuthenticatedConnection, authenticate};
 use shrinkwraprs::Shrinkwrap;
-use std::{sync::Arc, time::Duration};
-use tokio::time;
-use tracing::{debug, info, warn};
+use std::time::Duration;
+use tracing::debug;
 
 pub struct Connection {
     config: NntpConfig,
@@ -65,30 +64,5 @@ impl NntpPool {
             .build()?;
 
         Ok(NntpPool(pool))
-    }
-
-    pub async fn warm_pool(self: Arc<Self>) {
-        let target = *self.0.manager().config.max_connections;
-        info!("Pre-warming connection pool with {} connections", target);
-
-        for i in 0..target {
-            tokio::spawn({
-                let client = Arc::clone(&self);
-                async move {
-                    time::sleep(Duration::from_millis(i as u64 * 50)).await;
-
-                    match client.0.get().await {
-                        Ok(_) => {
-                            debug!("Pre-warmed connection {}", i);
-                        }
-                        Err(e) => {
-                            warn!("Failed to pre-warm connection {}: {}", i, e);
-                        }
-                    };
-                }
-            });
-        }
-
-        info!("Connection pool warmed");
     }
 }

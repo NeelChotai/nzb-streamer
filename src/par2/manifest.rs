@@ -1,5 +1,8 @@
+use bytes::Bytes;
+use itertools::Itertools;
 use std::{
     collections::{HashMap, HashSet},
+    fs,
     path::PathBuf,
 };
 
@@ -13,14 +16,13 @@ pub struct Par2Manifest {
 #[derive(Debug, Clone)]
 pub struct FileInfo {
     pub real_filename: String,
-    pub hash16k: Vec<u8>,
+    pub hash16k: Bytes,
 }
 
 #[derive(Debug)]
 pub struct DownloadTask {
+    pub path: PathBuf,
     pub nzb: nzb_rs::File,
-    pub obfuscated_path: PathBuf,
-    pub real_name: String,
 }
 
 impl Par2Manifest {
@@ -32,34 +34,40 @@ impl Par2Manifest {
         let hash_to_real: HashMap<_, _> = self
             .files
             .values()
-            .map(|info| (info.hash16k.as_slice(), info.real_filename.as_str()))
+            .map(|info| (info.hash16k.clone(), info.real_filename.as_str()))
             .collect();
 
-        let mut linked: Vec<_> = downloads
+        downloads
             .iter()
             .filter_map(|segment| {
-                hash_to_real
-                    .get(segment.hash16k.as_slice())
-                    .filter(|&&name| RarExt::from_filename(name).is_some())
-                    .map(|&name| DownloadTask {
+                let real_name = hash_to_real.get(&segment.hash16k)?;
+                let obfuscated = &segment.path;
+                let path = obfuscated.parent()?.join(real_name);
+
+                match fs::rename(obfuscated, &path) {
+                    // TODO: side effect not clear
+                    Ok(_) => Some(DownloadTask {
+                        path,
                         nzb: segment.nzb.clone(),
-                        obfuscated_path: segment.path.clone(),
-                        real_name: name.to_string(),
-                    })
+                    }), // TODO: don't clone
+                    Err(e) => {
+                        eprintln!("Failed to rename {obfuscated:?} → {path:?}: {e}");
+                        None
+                    }
+                }
             })
-            .collect();
-
-        linked.sort_by_key(|task| RarExt::from_filename(&task.real_name).unwrap());
-
-        linked
+            .sorted_by_key(|task| {
+                RarExt::from_filename(task.path.file_name().unwrap().to_str().unwrap()).unwrap()
+            })
+            .collect()
     }
 
-    pub fn find_missing_files(&self, hashes: &[Vec<u8>]) -> Vec<String> {
-        let downloaded: HashSet<_> = hashes.iter().map(|h| h.as_slice()).collect();
+    pub fn find_missing_files(&self, hashes: &[Bytes]) -> Vec<String> {
+        let downloaded: HashSet<_> = hashes.iter().collect();
 
         self.files
             .values()
-            .filter(|info| !downloaded.contains(info.hash16k.as_slice()))
+            .filter(|info| !downloaded.contains(&info.hash16k))
             .map(|info| info.real_filename.clone())
             .collect()
     }

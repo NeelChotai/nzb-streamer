@@ -3,6 +3,7 @@ use crate::scheduler::{batch::Job, error::SchedulerError};
 use std::collections::VecDeque;
 use std::path::PathBuf;
 
+#[derive(Debug)]
 pub struct FileQueue {
     path: PathBuf,
     segments: VecDeque<Job>,
@@ -10,8 +11,10 @@ pub struct FileQueue {
 }
 
 impl FileQueue {
-    pub fn new(task: DownloadTask, path: PathBuf) -> Result<Self, SchedulerError> {
+    pub fn new(task: DownloadTask) -> Result<Self, SchedulerError> {
         let total = task.nzb.segments.len() - 1;
+        let path = task.path;
+
         let segments: VecDeque<Job> = task
             .nzb
             .segments

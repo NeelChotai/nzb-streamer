@@ -10,6 +10,8 @@ pub enum StreamError {
     #[error("Error reading file")]
     Read(#[from] io::Error),
 
-    #[error("Tried to mark file with path '{0}' as complete, but does not exist in this VolumeSegment")]
-    FileNotFound(PathBuf)
+    #[error(
+        "Tried to mark file with path '{0}' as complete, but does not exist in this VolumeSegment"
+    )]
+    FileNotFound(PathBuf),
 }
