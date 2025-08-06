@@ -192,11 +192,6 @@ pub async fn stream(
     let (start, length) = range.unwrap_or((0, available));
     let end = start + length - 1;
 
-    let bytes_per_segment = 1_000_000; // Estimate
-    session
-        .tracker
-        .update_playback_position(start, bytes_per_segment); // TODO: i hate this bytes shit. we should track segments.
-
     let stream = session
         .streamer
         .read_range_with_chunk_size(start, length, IDEAL_CHUNK_SIZE); // TODO: ideal chunk size?
@@ -304,6 +299,7 @@ fn parse_range_header(headers: &HeaderMap, available_bytes: u64) -> Option<(u64,
     }
 }
 
+// TODO: handle duplicates
 async fn upload(
     State(state): State<AppState>,
     mut multipart: Multipart,
@@ -389,6 +385,8 @@ async fn upload(
                 "Starting background download of remaining segments for {} RAR files",
                 paths.len()
             );
+
+            
 
             scheduler
                 .schedule_downloads(tasks, &session_dir, session_id, streamer, tracker)

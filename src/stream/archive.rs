@@ -1,7 +1,4 @@
-use std::{
-    io::SeekFrom,
-    path::Path,
-};
+use std::{io::SeekFrom, path::Path};
 use tokio::{
     fs::File,
     io::{AsyncReadExt, AsyncSeekExt},

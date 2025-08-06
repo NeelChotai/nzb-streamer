@@ -3,7 +3,10 @@ use futures::Stream;
 use std::{
     io::{self, SeekFrom},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::{
     fs::File,
@@ -20,12 +23,13 @@ const PREFETCH_SIZE: usize = 16 * 1024 * 1024; // 16MB prefetch buffer
 #[derive(Debug, Clone)]
 pub struct VolumeSegment {
     pub path: PathBuf,
-    pub start: u64,
-    pub length: u64,
-    pub virtual_start: u64,
+    pub start: u64, // RAR header offset
+    pub length: u64, // Content length
+    pub virtual_start: u64, // Position in overall virtual stream
     pub is_complete: bool,
 }
 
+#[derive(Debug, Default)]
 pub struct VirtualFileStreamer {
     segments: Arc<RwLock<Vec<VolumeSegment>>>,
 }
@@ -39,8 +43,8 @@ impl VirtualFileStreamer {
                 path: path.to_path_buf(),
                 start: 0,
                 length: 0,
-                virtual_start: 0u64,
-                is_complete: false,
+                virtual_start: 0,
+                is_complete: false
             });
         }
 
@@ -50,87 +54,77 @@ impl VirtualFileStreamer {
     }
 
     pub async fn get_available_bytes(&self) -> u64 {
-        let segments = self.segments.read().await;
-        let mut available = 0u64;
+self.segments
+.read()
+.await
+.iter()
+.take_while(|seg| seg.is_complete)
+.last()
+.map(|seg| seg.virtual_start + seg.length)
+.unwrap_or(0)
+ }
 
-        for segment in segments.iter() {
-            if segment.is_complete {
-                available = segment.virtual_start + segment.length;
-            } else {
-                // Stop at first incomplete segment
-                break;
-            }
-        }
-
-        available
+     pub async fn complete_count(&self) -> usize {
+        self.segments
+            .read()
+            .await
+            .iter()
+            .filter(|s| s.is_complete)
+            .count()
     }
 
-    pub async fn mark_segment_downloaded(&self, path: &Path) -> Result<(), StreamError> {
+    pub async fn mark_file_complete(&self, path: &Path) -> Result<(), StreamError> {
         let mut segments = self.segments.write().await;
-        let segment_idx = segments
-            .iter()
-            .position(|s| s.path == path)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "Segment not found"))?;
-        let is_first = segment_idx == 0;
 
+        let (idx, segment) = segments
+            .iter_mut()
+            .enumerate()
+            .find(|(_, s)| s.path == path)
+            .ok_or_else(|| StreamError::FileNotFound(path.to_path_buf()))?;
+        
+        // Analyse RAR volume
+        let is_first = idx == 0; // TODO: this isn't correct
         let (start, length) = analyse_rar_volume(path, is_first).await?;
-
-        let segment = &mut segments[segment_idx];
+        
+        // Update segment with real data
         segment.start = start;
         segment.length = length;
         segment.is_complete = true;
-
-        let mut next_virtual_start = 0;
-        let mut available_bytes = 0;
-        let mut gap_encountered = false;
-
-        for seg in segments.iter_mut() {
-            seg.virtual_start = next_virtual_start;
-
-            if !gap_encountered && seg.is_complete {
-                next_virtual_start += seg.length;
-                available_bytes = next_virtual_start;
-            } else if !seg.is_complete {
-                // Found first gap - subsequent segments aren't contiguous
-                gap_encountered = true;
+        
+        // Recalculate virtual offsets for all complete segments
+        let mut offset = 0u64;
+        
+        for segment in segments.iter_mut() {
+            segment.virtual_start = offset;
+            if segment.is_complete {
+                offset += segment.length;
             }
         }
-
-        info!(
-            "Marked {} as complete. Available bytes: {}",
-            path.display(),
-            available_bytes
-        );
-
+        
+        info!("File {} complete: {} bytes at offset {}", 
+              path.display(), length, segment.virtual_start);
+        
         Ok(())
     }
 
-    pub fn stream(self) -> impl Stream<Item = Result<Bytes, StreamError>> {
-        async_stream::try_stream! {
-            let streamer = self.segments.read().await.clone();
+    pub async fn len(&self) -> usize {
+        self.segments.read().await.len()
+    }
 
-            for segment in streamer {
-                let mut file = File::open(&segment.path).await?;
-                file.seek(std::io::SeekFrom::Start(segment.start)).await?;
+    /// Get the last accessed segment index (for prioritisation)
+    pub async fn get_last_accessed_index(&self) -> Option<usize> {
+        // This could be tracked during read_range operations
+        // For now, return None
+        None
+    }
 
-                let mut remaining = segment.length;
-                let mut buffer = vec![0; 64 * 1024]; // 64KB buffer
-
-                while remaining > 0 {
-                    let read_size = buffer.len().min(remaining as usize);
-                    let buffer_slice = &mut buffer[..read_size];
-
-                    let mut read_buf = ReadBuf::new(buffer_slice);
-                    file.read_buf(&mut read_buf).await?;
-
-                    let filled = read_buf.filled();
-                    if filled.is_empty() {
-                        break;
-                    }
-
-                    yield Bytes::copy_from_slice(filled);
-                    remaining -= filled.len() as u64;
-                }
+        fn recalculate_virtual_offsets(&self, segments: &mut [VolumeSegment]) {
+        let mut offset = 0u64;
+        
+        for segment in segments.iter_mut() {
+            segment.virtual_start = offset;
+            if segment.is_complete {
+                offset += segment.length;
             }
         }
     }
@@ -140,76 +134,7 @@ impl VirtualFileStreamer {
         start: u64,
         length: u64,
     ) -> impl Stream<Item = Result<Bytes, StreamError>> {
-        let segments = Arc::clone(&self.segments);
-        let end = start + length;
-
-        async_stream::try_stream! {
-            let snapshot = segments.read().await.clone();
-
-            let mut buffer = BytesMut::with_capacity(VIDEO_CHUNK_SIZE + PREFETCH_SIZE);
-            let mut current_pos = start;
-            let mut current_file: Option<(PathBuf, File)> = None;
-
-             while current_pos < end {
-                // Find the segment containing current_pos
-                let segment = match snapshot
-                    .iter()
-                    .find(|s| s.virtual_start <= current_pos && current_pos < s.virtual_start + s.length)
-                {
-                    Some(s) => s,
-                    None => break,
-                };
-
-                // Reuse file handle if it's the same segment
-                let file = match &mut current_file {
-                    Some((path, file)) if path == &segment.path => file,
-                    _ => {
-                        let new_file = File::open(&segment.path).await?;
-                        current_file = Some((segment.path.clone(), new_file));
-                        &mut current_file.as_mut().unwrap().1
-                    }
-                };
-
-                // Calculate read position
-                let seg_offset = current_pos - segment.virtual_start;
-                let physical_pos = segment.start + seg_offset;
-                file.seek(SeekFrom::Start(physical_pos)).await?;
-
-                // Calculate how much to read
-                let segment_end = segment.virtual_start + segment.length;
-                let read_end = end.min(segment_end);
-                let total_to_read = (read_end - current_pos) as usize;
-
-                // Read a large chunk (up to VIDEO_CHUNK_SIZE)
-                let chunk_size = total_to_read.min(VIDEO_CHUNK_SIZE);
-                buffer.clear();
-                buffer.resize(chunk_size, 0);
-
-                let mut bytes_read = 0;
-                while bytes_read < chunk_size {
-                    match file.read(&mut buffer[bytes_read..]).await? {
-                        0 => break,
-                        n => bytes_read += n,
-                    }
-                }
-
-                if bytes_read == 0 {
-                    break;
-                }
-
-                // Yield the entire chunk at once
-                buffer.truncate(bytes_read);
-                yield buffer.clone().freeze();
-
-                current_pos += bytes_read as u64;
-
-                // Optional: Prefetch next chunk in background
-                if current_pos < end && bytes_read == chunk_size {
-                    // The next iteration will read the prefetched data
-                    // This happens automatically due to OS file caching
-                }
-            }
-        }
+        self.read_range_with_chunk_size(start, length, VIDEO_CHUNK_SIZE)
     }
 
     pub fn read_range_with_chunk_size(

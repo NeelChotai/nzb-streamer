@@ -51,6 +51,7 @@ deadpool = { version = "0.12.2", features = ["managed", "rt_tokio_1"] }
 shrinkwraprs = "0.3.0"
 crossbeam = "0.8.4"
 async-channel = "2.5.0"
+roaring = "0.11.2"
 
 [dev-dependencies]
 tempfile = "3"

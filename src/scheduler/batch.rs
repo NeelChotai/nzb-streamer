@@ -1,5 +1,5 @@
 use crate::scheduler::queue::FileQueue;
-use crate::stream::segment_tracker::{BufferHealth, SegmentTracker};
+use crate::stream::orchestrator::{self, BufferHealth, StreamOrchestrator};
 use nzb_rs::Segment;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -64,11 +64,11 @@ impl BatchGenerator {
         Self { files, wave_size }
     }
 
-    pub fn into_iter_with_tracker(
+    pub async fn into_iter_with_orchestrator(
         self,
-        tracker: Arc<SegmentTracker>,
+        orchastrator: Arc<StreamOrchestrator>,
     ) -> BatchIterator<impl Fn() -> Priority> {
-        let priority_fn = move || tracker.get_buffer_health().into();
+        let priority_fn = move async || orchastrator.get_buffer_health().await.into();
         BatchIterator {
             generator: self,
             priority_fn,

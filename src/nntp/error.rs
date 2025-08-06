@@ -16,7 +16,7 @@ pub enum NntpError {
     #[error("Error constructing pool")]
     CreatePool(#[from] deadpool::managed::BuildError),
 
-    #[error("Error constructing pool")]
+    #[error("Error acquiring thread")] // TODO: why is this causing problems
     AcquirePool(#[from] deadpool::managed::PoolError<NntpPoolError>),
 }
 

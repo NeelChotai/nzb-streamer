@@ -4,7 +4,8 @@ use crate::nntp::yenc::{compute_hash16k, extract_filename};
 use crate::par2::manifest::DownloadTask;
 use crate::scheduler::batch::{self, BatchGenerator, Priority};
 use crate::scheduler::{error::SchedulerError, queue::FileQueue, writer::FileWriterPool};
-use crate::stream::{VirtualFileStreamer, segment_tracker::SegmentTracker};
+use crate::stream::orchestrator::{BufferHealth, StreamOrchestrator};
+use dashmap::DashMap;
 use futures::future::join_all;
 use futures::stream::{self, StreamExt};
 use std::path::PathBuf;
@@ -80,13 +81,12 @@ impl AdaptiveScheduler {
         tasks: Vec<DownloadTask>,
         session_dir: &Path,
         session_id: Uuid,
-        streamer: Arc<VirtualFileStreamer>,
-        tracker: Arc<SegmentTracker>,
+        orchastrator: Arc<StreamOrchestrator>,
     ) -> Result<(), SchedulerError> {
         info!("Starting adaptive download for session {}", session_id);
 
         let session = self.prepare_session(tasks, session_dir).await?;
-        self.process_batches(session, tracker, streamer).await?;
+        self.process_batches(session, orchastrator).await?;
 
         info!("Download complete for session {}", session_id);
         Ok(())
@@ -122,8 +122,7 @@ impl AdaptiveScheduler {
     async fn process_batches(
         &self,
         session: Session,
-        tracker: Arc<SegmentTracker>,
-        streamer: Arc<VirtualFileStreamer>,
+        orchestrator: Arc<StreamOrchestrator>,
     ) -> Result<(), SchedulerError> {
         let (tx, rx) = async_channel::bounded(self.max_workers * 2);
 
@@ -133,12 +132,7 @@ impl AdaptiveScheduler {
                 .iter()
                 .map(|q| (q.path().clone(), q.total_segments())),
         ));
-        let completed = Arc::new(dashmap::DashMap::from_iter(
-            session
-                .file_queues
-                .iter()
-                .map(|q| (q.path().clone(), 0usize)),
-        ));
+
         let workers = (0..self.max_workers)
             .map(|id| {
                 spawn_worker(
@@ -146,16 +140,14 @@ impl AdaptiveScheduler {
                     rx.clone(),
                     self.client.clone(),
                     session.writers.clone(),
-                    completed.clone(),
+                    orchestrator.clone(),
                     file_segments.clone(),
-                    streamer.clone(),
-                    tracker.clone(),
                 )
             })
             .collect::<Vec<_>>();
 
         let generator = BatchGenerator::new(session.file_queues, self.max_workers)
-            .into_iter_with_tracker(tracker.clone());
+            .into_iter_with_orchestrator(orchestrator.clone());
 
         for batch in generator {
             debug!(
@@ -169,9 +161,25 @@ impl AdaptiveScheduler {
             }
 
             // Adaptive backpressure
-            if batch.priority == Priority::Critical {
-                while tx.len() > self.max_workers / 2 {
-                    tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+            match orchestrator.get_buffer_health().await {
+                BufferHealth::Critical => {
+                    // Prioritise playback area
+                    while tx.len() > 1 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+                    }
+                }
+                BufferHealth::Poor => {
+                    while tx.len() > self.max_workers / 2 {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
+                    }
+                }
+                _ => {
+                    // Normal operation
+                    if batch.priority == Priority::Critical {
+                        while tx.len() > self.max_workers {
+                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+                        }
+                    }
                 }
             }
         }
@@ -194,38 +202,67 @@ fn spawn_worker(
     rx: async_channel::Receiver<batch::Job>,
     client: Arc<NntpClient>,
     writers: FileWriterPool,
-    completed: Arc<dashmap::DashMap<PathBuf, usize>>,
-    file_totals: Arc<dashmap::DashMap<PathBuf, usize>>,
-    streamer: Arc<VirtualFileStreamer>,
-    tracker: Arc<SegmentTracker>,
+    orchestrator: Arc<StreamOrchestrator>,
+    file_segments: Arc<DashMap<PathBuf, usize>>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         debug!("Worker {} started", id);
 
         while let Ok(job) = rx.recv().await {
-            match client.download(job.segment()).await {
-                Ok(data) => {
-                    if let Err(e) = writers.write(job.path(), job.index(), data).await {
-                        error!("Worker {} write failed: {}", id, e);
-                    } else {
-                        let mut entry = completed.entry(job.path().clone()).or_insert(0);
-                        *entry += 1;
-
-                        if let Some(total) = file_totals.get(job.path()) {
-                            if *entry == *total {
-                                info!("File {} complete", job.path().display());
-                                let _ = streamer.mark_segment_downloaded(job.path()).await;
-                                tracker.mark_segment_complete(job.index()); // TODO : why two
-                            }
+            match process_job(&job, &client, &writers).await {
+                Ok(_) => {
+                    let path = job.path().clone();
+                    let mut should_notify = false;
+                    
+                    if let Some(mut entry) = file_segments.get_mut(&path) {
+                        entry.1 += 1; // Increment completed
+                        debug!("File {} progress: {}/{}", 
+                               path.display(), entry.1, entry.0);
+                        
+                        if entry.1 == entry.0 {
+                            should_notify = true;
+                            info!("File {} fully downloaded", path.display());
+                        }
+                    }
+                    
+                    // Notify orchestrator only when file is complete
+                    if should_notify {
+                        if let Err(e) = orchestrator.mark_file_complete(&path).await {
+                            error!("Failed to mark file complete: {}", e);
                         }
                     }
                 }
                 Err(e) => {
-                    error!("Worker {} download failed: {}", id, e);
+                    error!("Worker {} failed: {}", id, e);
                 }
             }
         }
-
+        
         debug!("Worker {} finished", id);
     })
 }
+
+async fn process_job(
+    job: &batch::Job,
+    client: &NntpClient,
+    writers: &FileWriterPool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let data = client.download(job.segment()).await?;
+    writers.write(job.path(), job.index(), data).await?;
+    Ok(())
+}
+
+// Extension for BatchGenerator to work with orchestrator
+// impl BatchGenerator {
+//     pub fn into_iter_with_orchestrator(
+//         self,
+//         orchestrator: Arc<StreamOrchestrator>,
+//     ) -> impl Iterator<Item = Batch> {
+//         // Get priority index from orchestrator
+//         let priority_file = orchestrator.get_priority_index();
+        
+//         // The BatchGenerator should prioritise files near the priority index
+//         // This would be implemented in the BatchGenerator itself
+//         self.into_iter()
+//     }
+// }
