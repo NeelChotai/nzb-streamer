@@ -32,60 +32,6 @@ pub async fn analyse_rar_volume(path: &Path, is_first: bool) -> Result<(u64, u64
     let mut data_offset = 0;
     let mut data_length = 0;
 
-    // Parse volume headers
-    // loop {
-    //     let _header_crc = match file.read_u16_le().await {
-    //         Ok(v) => v,
-    //         Err(_) => break, // EOF
-    //     };
-
-    //     let header_type = {
-    //         let mut buf = [0u8; 1];
-    //         file.read_exact(&mut buf).await?;
-    //         buf[0]
-    //     };
-
-    //     let _ = file.read_u16_le().await?; // flags
-    //     let header_size = file.read_u16_le().await?;
-
-    //     match header_type {
-    //         RAR_MAIN_HEAD => {
-    //             file.seek(SeekFrom::Current(header_size as i64 - 7)).await?;
-    //         }
-    //         RAR_FILE_HEAD => {
-    //             let pack_size = file.read_u32_le().await? as u64;
-    //             let _ = file.read_u32_le().await?; // unpacked size
-
-    //             // Skip remaining header
-    //             let skip_size = header_size as i64 - 7 - 8;
-    //             file.seek(SeekFrom::Current(skip_size)).await?;
-
-    //             data_offset = file.stream_position().await?;
-    //             data_length = pack_size;
-
-    //             // For first volume, find MKV signature
-    //             if is_first {
-    //                 let mut search_buf = vec![0u8; 1024.min(pack_size as usize)];
-    //                 let current_pos = data_offset;
-    //                 file.read_exact(&mut search_buf).await?;
-
-    //                 if let Some(mkv_offset) = search_buf.windows(4).position(|w| w == MKV_SIGNATURE)
-    //                 {
-    //                     data_offset = current_pos + mkv_offset as u64;
-    //                     data_length = pack_size - mkv_offset as u64;
-    //                 }
-    //             }
-    //             break;
-    //         }
-    //         RAR_ENDARC_HEAD => {
-    //             break;
-    //         }
-    //         _ => {
-    //             file.seek(SeekFrom::Current(header_size as i64 - 7)).await?;
-    //         }
-    //     }
-    // }
-
     while let Ok(_header_crc) = file.read_u16_le().await {
         let header_type = file.read_u8().await?;
         let _ = file.read_u16_le().await?; // flags
@@ -131,4 +77,94 @@ pub async fn analyse_rar_volume(path: &Path, is_first: bool) -> Result<(u64, u64
     }
 
     Ok((data_offset, data_length))
+}
+
+#[derive(Debug, Clone, Eq, PartialEq)]
+pub enum RarExt {
+    Main,
+    Part(u32),
+}
+
+impl RarExt {
+    pub fn from_filename(filename: &str) -> Option<Self> {
+        if filename.ends_with(".rar") {
+            Some(RarExt::Main)
+        } else {
+            extract_rar_number(filename).map(RarExt::Part)
+        }
+    }
+}
+
+impl Ord for RarExt {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        use RarExt::*;
+        match (self, other) {
+            (Main, Main) => std::cmp::Ordering::Equal,
+            (Main, _) => std::cmp::Ordering::Less,
+            (_, Main) => std::cmp::Ordering::Greater,
+            (Part(a), Part(b)) => a.cmp(b),
+        }
+    }
+}
+
+impl PartialOrd for RarExt {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+fn extract_rar_number(filename: &str) -> Option<u32> {
+    filename.rsplit_once('.').and_then(|(_, ext)| {
+        ext.strip_prefix('r')
+            .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit()))
+            .and_then(|s| s.parse().ok())
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_extract_rar_number() {
+        let cases = [
+            ("file.rar", None),
+            ("file.r00", Some(0)),
+            ("file.r01", Some(1)),
+            ("file.r99", Some(99)),
+            ("file.r9999", Some(9999)),
+            ("roll.roll.on.r00", Some(0)),
+            ("path/to/file.r05", Some(5)),
+            ("file.ra0", None), // Not a number
+            ("file.r", None),   // No digits
+            ("r00", None),      // No dot
+            ("file.txt", None), // Wrong extension
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(
+                extract_rar_number(input),
+                expected,
+                "Failed for input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_rar_sorting() {
+        let mut files = vec!["file.r02", "file.r00", "file.rar", "file.r10", "file.r01"];
+
+        files.sort_by_key(|name| {
+            if name.ends_with(".rar") {
+                (0, 0)
+            } else {
+                (1, extract_rar_number(name).unwrap_or(999))
+            }
+        });
+
+        assert_eq!(
+            files,
+            vec!["file.rar", "file.r00", "file.r01", "file.r02", "file.r10",]
+        );
+    }
 }

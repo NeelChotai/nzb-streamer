@@ -6,7 +6,7 @@ use std::{
     path::PathBuf,
 };
 
-use crate::{par2::rar::RarExt, scheduler::adaptive::FirstSegment};
+use crate::{archive::rar::RarExt, scheduler::adaptive::FirstSegment};
 
 #[derive(Debug)]
 pub struct Par2Manifest {

@@ -2,15 +2,15 @@ use std::{collections::HashMap, path::Path};
 
 use tracing::warn;
 
-use crate::par2::{
+use crate::archive::{
     error::Par2Error,
-    manifest::{FileInfo, Par2Manifest},
     packet::{Packet, parse_packet},
+    par2::{FileInfo, Par2Manifest},
 };
 
 pub mod error;
-pub mod manifest;
 pub mod packet;
+pub mod par2;
 pub mod rar;
 
 pub fn parse_file(path: &Path) -> Result<Par2Manifest, Par2Error> {

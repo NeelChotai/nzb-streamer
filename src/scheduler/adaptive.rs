@@ -1,7 +1,7 @@
+use crate::archive::par2::DownloadTask;
 use crate::nntp::client::NntpClient;
 use crate::nntp::config::NntpConfig;
 use crate::nntp::yenc::{compute_hash16k, extract_filename};
-use crate::par2::manifest::DownloadTask;
 use crate::scheduler::batch::{self, BatchGenerator, Priority};
 use crate::scheduler::{error::SchedulerError, queue::FileQueue, writer::FileWriterPool};
 use crate::stream::orchestrator::{BufferHealth, StreamOrchestrator};

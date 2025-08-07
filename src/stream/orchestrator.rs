@@ -7,7 +7,7 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use tokio::sync::RwLock;
 use tracing::{debug, info};
 
-use crate::stream::archive::analyse_rar_volume;
+use crate::archive::rar::analyse_rar_volume;
 use crate::stream::error::StreamError;
 use crate::stream::virtual_file_streamer::{FileLayout, VirtualFileStreamer};
 

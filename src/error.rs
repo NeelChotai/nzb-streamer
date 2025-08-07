@@ -11,7 +11,7 @@ use thiserror::Error;
 use tracing::error;
 
 use crate::{
-    nntp::error::NntpError, nzb::error::NzbError, par2::error::Par2Error,
+    archive::error::Par2Error, nntp::error::NntpError, nzb::error::NzbError,
     scheduler::error::SchedulerError,
 };
 

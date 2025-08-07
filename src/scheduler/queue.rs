@@ -1,4 +1,4 @@
-use crate::par2::manifest::DownloadTask;
+use crate::archive::par2::DownloadTask;
 use crate::scheduler::{batch::Job, error::SchedulerError};
 use std::collections::VecDeque;
 use std::path::PathBuf;
