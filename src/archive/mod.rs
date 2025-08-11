@@ -3,7 +3,7 @@ use std::{collections::HashMap, path::Path};
 use tracing::warn;
 
 use crate::archive::{
-    error::Par2Error,
+    error::ArchiveError,
     packet::{Packet, parse_packet},
     par2::{FileInfo, Par2Manifest},
 };
@@ -13,12 +13,12 @@ pub mod packet;
 pub mod par2;
 pub mod rar;
 
-pub fn parse_file(path: &Path) -> Result<Par2Manifest, Par2Error> {
+pub fn parse_file(path: &Path) -> Result<Par2Manifest, ArchiveError> {
     let buffer = std::fs::read(path)?;
     parse_buffer(&buffer)
 }
 
-pub fn parse_buffer(buffer: &[u8]) -> Result<Par2Manifest, Par2Error> {
+pub fn parse_buffer(buffer: &[u8]) -> Result<Par2Manifest, ArchiveError> {
     let packets = scan_for_packets(buffer);
 
     let mut files = HashMap::new();
@@ -41,7 +41,7 @@ pub fn parse_buffer(buffer: &[u8]) -> Result<Par2Manifest, Par2Error> {
     }
 
     if files.is_empty() {
-        return Err(Par2Error::NoFiles);
+        return Err(ArchiveError::NoFiles);
     }
 
     if !found_main {

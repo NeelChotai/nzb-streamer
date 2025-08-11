@@ -2,7 +2,7 @@ use crate::archive::par2::DownloadTask;
 use crate::nntp::client::NntpClient;
 use crate::nntp::config::NntpConfig;
 use crate::nntp::yenc::{compute_hash16k, extract_filename};
-use crate::scheduler::batch::{self, BatchGenerator, Priority};
+use crate::scheduler::batch::{self, BatchGenerator};
 use crate::scheduler::{error::SchedulerError, queue::FileQueue, writer::FileWriterPool};
 use crate::stream::orchestrator::{BufferHealth, StreamOrchestrator};
 use bytes::Bytes;
@@ -124,7 +124,7 @@ impl AdaptiveScheduler {
     ) -> Result<(), SchedulerError> {
         let (tx, rx) = async_channel::bounded(self.max_workers * 2);
 
-        let file_segments = Arc::new(dashmap::DashMap::from_iter(
+        let file_segments = Arc::new(DashMap::from_iter(
             session
                 .file_queues
                 .iter()
@@ -158,10 +158,8 @@ impl AdaptiveScheduler {
                 tx.send(job).await?;
             }
 
-            // Adaptive backpressure
             match orchestrator.get_buffer_health() {
                 BufferHealth::Critical => {
-                    // Prioritise playback area
                     while tx.len() > 1 {
                         tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
                     }
@@ -172,11 +170,8 @@ impl AdaptiveScheduler {
                     }
                 }
                 _ => {
-                    // Normal operation
-                    if batch.priority == Priority::Critical {
-                        while tx.len() > self.max_workers {
-                            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                        }
+                    while tx.len() > self.max_workers {
+                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
                     }
                 }
             }

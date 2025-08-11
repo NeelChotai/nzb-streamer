@@ -11,7 +11,7 @@ use thiserror::Error;
 use tracing::error;
 
 use crate::{
-    archive::error::Par2Error, nntp::error::NntpError, nzb::error::NzbError,
+    archive::error::ArchiveError, nntp::error::NntpError, nzb::error::NzbError,
     scheduler::error::SchedulerError,
 };
 
@@ -29,8 +29,8 @@ pub enum RestError {
     #[error("Error encountered reading uploaded file contents")]
     Utf8Parse(#[from] FromUtf8Error),
 
-    #[error("Error encountered attempting to decode PAR2 recovery file")]
-    Par2(#[from] Par2Error),
+    #[error("Error encountered attempting to parse archive")]
+    Par2(#[from] ArchiveError),
 
     #[error("Invalid range header")]
     InvalidRange,

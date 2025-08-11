@@ -2,11 +2,10 @@ use std::{io, path::PathBuf};
 
 use thiserror::Error;
 
+use crate::archive::error::ArchiveError;
+
 #[derive(Error, Debug)]
 pub enum StreamError {
-    #[error("No RAR signature for file '{0}'")]
-    MalformedRar(String),
-
     #[error("Error reading file")]
     Read(#[from] io::Error),
 
@@ -14,4 +13,7 @@ pub enum StreamError {
         "Tried to mark file with path '{0}' as complete, but does not exist in this VolumeSegment"
     )]
     FileNotFound(PathBuf),
+
+    #[error(transparent)]
+    Archive(#[from] ArchiveError),
 }

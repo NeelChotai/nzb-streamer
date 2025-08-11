@@ -1,8 +1,8 @@
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum Par2Error {
-    #[error("Error reading PAR2 file")]
+pub enum ArchiveError {
+    #[error("Error reading file")]
     Io(#[from] std::io::Error),
 
     #[error("No files found")]
@@ -13,4 +13,7 @@ pub enum Par2Error {
 
     #[error("PAR2 parsing error")]
     Parse,
+
+    #[error("RAR signature not found in buffer")]
+    MalformedRar,
 }
