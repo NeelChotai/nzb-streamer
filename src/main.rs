@@ -324,7 +324,7 @@ async fn upload(
         plain(nzb, &session_dir)
     }?;
 
-    let paths: Vec<_> = tasks.iter().map(|segment| segment.path.clone()).collect();
+    let paths: Vec<_> = tasks.iter().map(|segment| segment.path().clone()).collect();
 
     let orchestrator = Arc::new(StreamOrchestrator::new(&paths).await.unwrap());
     state
@@ -411,7 +411,7 @@ fn plain(nzb: Nzb, session_dir: &path::Path) -> Result<Vec<DownloadTask>, RestEr
     let tasks: Vec<_> = nzb
         .rar
         .iter()
-        .map(|file| DownloadTask {
+        .map(|file| DownloadTask::New {
             path: session_dir.join(extract_filename(&file.subject)),
             nzb: file.clone(),
         })

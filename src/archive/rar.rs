@@ -24,18 +24,21 @@ pub async fn analyse_rar_volume(path: &Path, is_first: bool) -> Result<(u64, u64
     let mut buffer = vec![0u8; 1024.min(file_size as usize)]; // TODO: how much of the file do we need?
     file.read_exact(&mut buffer).await?;
 
-    analyse_rar_buffer(Bytes::from(buffer), is_first).await
+    analyse_rar_buffer(&buffer.into(), is_first).await
 }
 
-pub async fn analyse_rar_buffer(buffer: Bytes, is_first: bool) -> Result<(u64, u64), ArchiveError> {
+pub async fn analyse_rar_buffer(
+    buffer: &Bytes,
+    is_first: bool,
+) -> Result<(u64, u64), ArchiveError> {
     let rar_offset = buffer
         .windows(7)
         .position(|w| w == RAR_SIGNATURE)
-        .ok_or(ArchiveError::MalformedRar)? as u64;
+        .map(|offset| offset as u64 + 7)
+        .ok_or(ArchiveError::MalformedRar)?;
 
     let mut cursor = Cursor::new(buffer);
-
-    cursor.seek(SeekFrom::Start(rar_offset + 7)).await?;
+    cursor.seek(SeekFrom::Start(rar_offset)).await?;
 
     let mut data_offset = 0;
     let mut data_length = 0;
@@ -77,9 +80,7 @@ pub async fn analyse_rar_buffer(buffer: Bytes, is_first: bool) -> Result<(u64, u
 
                 break;
             }
-            RAR_ENDARC_HEAD => {
-                break;
-            }
+            RAR_ENDARC_HEAD => break,
             _ => {
                 cursor
                     .seek(SeekFrom::Current(header_size as i64 - 7))

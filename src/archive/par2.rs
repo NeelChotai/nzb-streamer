@@ -20,9 +20,32 @@ pub struct FileInfo {
 }
 
 #[derive(Debug)]
-pub struct DownloadTask {
-    pub path: PathBuf,
-    pub nzb: nzb_rs::File,
+pub enum DownloadTask {
+    New {
+        path: PathBuf,
+        nzb: nzb_rs::File,
+    },
+    FromFirstSegment {
+        path: PathBuf,
+        nzb: nzb_rs::File,
+        data: Bytes,
+    },
+}
+
+impl DownloadTask {
+    pub fn path(&self) -> &PathBuf {
+        match self {
+            DownloadTask::New { path, .. } => path,
+            DownloadTask::FromFirstSegment { path, .. } => path,
+        }
+    }
+
+    pub fn nzb(&self) -> &nzb_rs::File {
+        match self {
+            DownloadTask::New { nzb, .. } => nzb,
+            DownloadTask::FromFirstSegment { nzb, .. } => nzb,
+        }
+    }
 }
 
 impl Par2Manifest {
@@ -46,9 +69,10 @@ impl Par2Manifest {
 
                 match fs::rename(obfuscated, &path) {
                     // TODO: side effect not clear
-                    Ok(_) => Some(DownloadTask {
+                    Ok(_) => Some(DownloadTask::FromFirstSegment {
                         path,
                         nzb: segment.nzb.clone(),
+                        data: segment.bytes.clone(),
                     }), // TODO: don't clone
                     Err(e) => {
                         eprintln!("Failed to rename {obfuscated:?} → {path:?}: {e}");
@@ -57,7 +81,7 @@ impl Par2Manifest {
                 }
             })
             .sorted_by_key(|task| {
-                RarExt::from_filename(task.path.file_name().unwrap().to_str().unwrap()).unwrap()
+                RarExt::from_filename(task.path().file_name().unwrap().to_str().unwrap()).unwrap()
             })
             .collect()
     }

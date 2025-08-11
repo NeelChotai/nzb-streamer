@@ -28,13 +28,13 @@ impl FileWriterPool {
         }
     }
 
-    pub async fn add_file(&self, path: &Path) -> Result<(), SchedulerError> {
-        let (tx, rx) = mpsc::channel(100);
+    pub async fn add_file(&self, path: &Path, start_index: usize) -> Result<(), SchedulerError> {
+        let (tx, rx) = mpsc::channel(100); // TODO: size
         self.writers.insert(path.to_owned(), tx);
 
         let path = path.to_owned();
         tokio::spawn(async move {
-            if let Err(e) = ordered_file_writer(path, rx).await {
+            if let Err(e) = ordered_file_writer(path, rx, start_index).await {
                 error!("File writer error: {}", e);
             }
         });
@@ -72,6 +72,7 @@ impl FileWriterPool {
 async fn ordered_file_writer(
     path: PathBuf,
     mut rx: mpsc::Receiver<(usize, Bytes)>,
+    first_segment_index: usize,
 ) -> Result<(), std::io::Error> {
     let mut file = OpenOptions::new()
         .create(true)
@@ -79,7 +80,7 @@ async fn ordered_file_writer(
         .open(&path)
         .await?;
 
-    let mut expected = 1; // Skip segment 0
+    let mut expected = first_segment_index; // skip downloaded segment
     let mut pending: BTreeMap<usize, Bytes> = BTreeMap::new();
 
     while let Some((index, data)) = rx.recv().await {

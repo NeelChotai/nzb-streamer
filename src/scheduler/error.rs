@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use bytes::Bytes;
 use thiserror::Error;
 
-use crate::{nntp::error::NntpError, scheduler::batch::Job};
+use crate::{archive::error::ArchiveError, nntp::error::NntpError, scheduler::batch::Job};
 
 #[derive(Error, Debug)]
 pub enum SchedulerError {
@@ -24,4 +24,7 @@ pub enum SchedulerError {
 
     #[error("Tried to write file to path '{0}', but does not exist")]
     FileNotFound(PathBuf),
+
+    #[error("Error getting offset and length from file")]
+    Archive(#[from] ArchiveError),
 }

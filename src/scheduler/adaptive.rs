@@ -25,6 +25,7 @@ pub struct FirstSegment {
     pub path: PathBuf,
     pub nzb: nzb_rs::File,
     pub hash16k: Bytes,
+    pub bytes: Bytes,
 }
 
 impl AdaptiveScheduler {
@@ -70,6 +71,8 @@ impl AdaptiveScheduler {
         let data = self.client.download(first_segment).await?;
         let hash16k = compute_hash16k(&data);
         let filename = extract_filename(&file.subject);
+        //let is_first = RarExt::from_filename(&filename).is_some_and(|ext| ext == RarExt::Main);
+        //let (offset, length) = analyse_rar_buffer(&data, is_first).await?;
         let path = output_dir.join(&filename);
 
         tokio::fs::write(&path, &data).await?;
@@ -78,6 +81,7 @@ impl AdaptiveScheduler {
             path,
             nzb: file,
             hash16k: hash16k.into(),
+            bytes: data,
         })
     }
 
@@ -101,9 +105,13 @@ impl AdaptiveScheduler {
         let file_queues = stream::iter(tasks)
             .then(|task| {
                 let writers = &writers;
+                let start = match task {
+                    DownloadTask::New { .. } => 0,
+                    DownloadTask::FromFirstSegment { .. } => 1,
+                };
                 async move {
-                    writers.add_file(&task.path).await?;
-                    FileQueue::new(task)
+                    writers.add_file(task.path(), start).await?;
+                    FileQueue::new(task.path().clone(), task.nzb().clone(), start)
                 }
             })
             .collect::<Vec<_>>()
@@ -124,12 +132,10 @@ impl AdaptiveScheduler {
     ) -> Result<(), SchedulerError> {
         let (tx, rx) = async_channel::bounded(self.max_workers * 2);
 
-        let file_segments = Arc::new(DashMap::from_iter(
-            session
-                .file_queues
-                .iter()
-                .map(|q| (q.path().clone(), (q.total_segments(), 1))), // TODO: first segment done, is this the right place to put this?
-        ));
+        let file_segments =
+            Arc::new(DashMap::from_iter(session.file_queues.iter().map(|q| {
+                (q.path().clone(), (q.total_segments(), q.start_index()))
+            })));
 
         let workers = (0..self.max_workers)
             .map(|id| {

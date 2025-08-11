@@ -1,4 +1,3 @@
-use crate::archive::par2::DownloadTask;
 use crate::scheduler::{batch::Job, error::SchedulerError};
 use std::collections::VecDeque;
 use std::path::PathBuf;
@@ -8,19 +7,22 @@ pub struct FileQueue {
     path: PathBuf,
     segments: VecDeque<Job>,
     total: usize,
+    start_index: usize,
 }
 
 impl FileQueue {
-    pub fn new(task: DownloadTask) -> Result<Self, SchedulerError> {
-        let total = task.nzb.segments.len() - 1;
-        let path = task.path;
+    pub fn new(
+        path: PathBuf,
+        nzb: nzb_rs::File,
+        start_index: usize,
+    ) -> Result<Self, SchedulerError> {
+        let total = nzb.segments.len() - start_index;
 
-        let segments: VecDeque<Job> = task
-            .nzb
+        let segments: VecDeque<Job> = nzb
             .segments
             .into_iter()
             .enumerate()
-            .skip(1)
+            .skip(start_index)
             .map(|(idx, segment)| Job::new(segment, path.clone(), idx))
             .collect();
 
@@ -28,6 +30,7 @@ impl FileQueue {
             path,
             segments,
             total,
+            start_index,
         })
     }
 
@@ -47,5 +50,9 @@ impl FileQueue {
 
     pub fn total_segments(&self) -> usize {
         self.total
+    }
+
+    pub fn start_index(&self) -> usize {
+        self.start_index
     }
 }
