@@ -2,8 +2,11 @@ use std::path::PathBuf;
 
 use bytes::Bytes;
 use thiserror::Error;
+use tokio::sync::mpsc;
 
-use crate::{archive::error::ArchiveError, nntp::error::NntpError, scheduler::batch::Job};
+use crate::{
+    archive::error::ArchiveError, nntp::error::NntpError, stream::orchestrator::OrchestratorEvent,
+};
 
 #[derive(Error, Debug)]
 pub enum SchedulerError {
@@ -14,10 +17,12 @@ pub enum SchedulerError {
     Io(#[from] std::io::Error),
 
     #[error("Error in channel communication on write")]
-    Write(#[from] tokio::sync::mpsc::error::SendError<(usize, Bytes)>),
+    Write(#[from] mpsc::error::SendError<(usize, Bytes)>),
 
-    #[error("Error in channel communication during job dispatch")]
-    Dispatch(#[from] async_channel::SendError<Job>),
+    // #[error("Error in channel communication during job dispatch")]
+    // Dispatch(#[from] async_channel::SendError<Job>),
+    #[error("Error communicating with event channel")]
+    Communication(#[from] mpsc::error::SendError<OrchestratorEvent>),
 
     #[error("File '{0}' contained no subjects, source NZB may be malformed")]
     EmptyFile(String),

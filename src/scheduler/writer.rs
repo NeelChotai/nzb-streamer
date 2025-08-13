@@ -10,15 +10,9 @@ use tracing::{error, info};
 
 use crate::scheduler::error::SchedulerError;
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct FileWriterPool {
     writers: Arc<DashMap<PathBuf, mpsc::Sender<(usize, Bytes)>>>,
-}
-
-impl Default for FileWriterPool {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 impl FileWriterPool {
@@ -53,6 +47,7 @@ impl FileWriterPool {
             .ok_or_else(|| SchedulerError::FileNotFound(path.to_path_buf()))?
             .send((index, data))
             .await?;
+
         Ok(())
     }
 

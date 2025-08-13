@@ -11,9 +11,9 @@ default-run = "nzb-streamer"
 axum = { version = "0.8", features = ["macros", "multipart"] }
 tower-http = { version = "0.6", features = ["cors", "trace", "fs"] }
 
-tokio = { version = "1.46", features = ["full"] }
+tokio = { version = "1.47", features = ["full"] }
 
-clap = { version = "4.0", features = ["derive"] }
+clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 
 rek2_nntp = { path = "/home/neel/projects/rek2_nntp" }
@@ -21,13 +21,11 @@ yenc = "0.2"
 
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-nom = "8"
 
 bytes = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
 thiserror = "2"
 hex = "0.4"
-async-trait = "0.1"
 derive_more = { version = "2.0", features = ["full"] }
 
 http = "1"
@@ -44,17 +42,15 @@ byteorder = "1.5.0"
 config = "0.15.13"
 backoff = { version = "0.4.0", features = ["tokio"] }
 async-stream = "0.3.6"
-md-5 = "0.10.6"
-futures-util = "0.3.31"
 dashmap = "6.1.0"
 deadpool = { version = "0.12.2", features = ["managed", "rt_tokio_1"] }
 shrinkwraprs = "0.3.0"
-crossbeam = "0.8.4"
 async-channel = "2.5.0"
-roaring = "0.11.2"
 itertools = "0.14.0"
-crossbeam-channel = "0.5.15"
 arc-swap = "1.7.1"
+parking_lot = "0.12.4"
+md-5 = "0.10.6"
+ordered-stream = "0.2.0"
 
 [dev-dependencies]
 tempfile = "3"

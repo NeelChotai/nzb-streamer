@@ -1,16 +1,16 @@
 use crate::archive::par2::DownloadTask;
+use crate::archive::rar::{RarExt, analyse_rar_buffer};
 use crate::nntp::client::NntpClient;
 use crate::nntp::config::NntpConfig;
 use crate::nntp::yenc::{compute_hash16k, extract_filename};
 use crate::scheduler::batch::{self, BatchGenerator};
 use crate::scheduler::{error::SchedulerError, queue::FileQueue, writer::FileWriterPool};
-use crate::stream::orchestrator::{BufferHealth, StreamOrchestrator};
+use crate::stream::orchestrator::{BufferHealth, OrchestratorEvent};
 use bytes::Bytes;
-use dashmap::DashMap;
-use futures::future::join_all;
 use futures::stream::{self, StreamExt};
 use std::path::PathBuf;
 use std::{path::Path, sync::Arc};
+use tokio::sync::{mpsc, watch};
 
 use tracing::{debug, error, info};
 use uuid::Uuid;
@@ -71,8 +71,6 @@ impl AdaptiveScheduler {
         let data = self.client.download(first_segment).await?;
         let hash16k = compute_hash16k(&data);
         let filename = extract_filename(&file.subject);
-        //let is_first = RarExt::from_filename(&filename).is_some_and(|ext| ext == RarExt::Main);
-        //let (offset, length) = analyse_rar_buffer(&data, is_first).await?;
         let path = output_dir.join(&filename);
 
         tokio::fs::write(&path, &data).await?;
@@ -89,163 +87,96 @@ impl AdaptiveScheduler {
         &self,
         tasks: Vec<DownloadTask>,
         session_id: Uuid,
-        orchastrator: Arc<StreamOrchestrator>,
+        event_tx: mpsc::Sender<OrchestratorEvent>,
+        health_rx: watch::Receiver<BufferHealth>,
     ) -> Result<(), SchedulerError> {
         info!("Starting adaptive download for session {}", session_id);
 
-        let session = self.prepare_session(tasks).await?;
-        self.process_batches(session, orchastrator).await?;
-
-        info!("Download complete for session {}", session_id);
-        Ok(())
-    }
-
-    async fn prepare_session(&self, tasks: Vec<DownloadTask>) -> Result<Session, SchedulerError> {
         let writers = FileWriterPool::new();
-        let file_queues = stream::iter(tasks)
-            .then(|task| {
-                let writers = &writers;
-                let start = match task {
-                    DownloadTask::New { .. } => 0,
-                    DownloadTask::FromFirstSegment { .. } => 1,
-                };
-                async move {
-                    writers.add_file(task.path(), start).await?;
-                    FileQueue::new(task.path().clone(), task.nzb().clone(), start)
-                }
-            })
-            .collect::<Vec<_>>()
-            .await
-            .into_iter()
-            .collect::<Result<Vec<_>, _>>()?;
+        let mut file_queues = Vec::with_capacity(tasks.len());
 
-        Ok(Session {
-            file_queues,
-            writers,
-        })
-    }
+        for task in &tasks {
+            writers.add_file(task.path(), task.start_segment()).await?;
+            file_queues.push(FileQueue::new(
+                task.path().clone(),
+                task.nzb().clone(),
+                task.start_segment(),
+            )?);
+        }
 
-    async fn process_batches(
-        &self,
-        session: Session,
-        orchestrator: Arc<StreamOrchestrator>,
-    ) -> Result<(), SchedulerError> {
         let (tx, rx) = async_channel::bounded(self.max_workers * 2);
 
-        let file_segments =
-            Arc::new(DashMap::from_iter(session.file_queues.iter().map(|q| {
-                (q.path().clone(), (q.total_segments(), q.start_index()))
-            })));
-
         let workers = (0..self.max_workers)
-            .map(|id| {
-                spawn_worker(
-                    id,
-                    rx.clone(),
-                    self.client.clone(),
-                    session.writers.clone(),
-                    orchestrator.clone(),
-                    file_segments.clone(),
-                )
+            .map(|_| {
+                let rx = rx.clone();
+                let client = self.client.clone();
+                let writers = writers.clone();
+                let event_tx = event_tx.clone();
+
+                tokio::spawn(async move { spawn_worker(rx, client, writers, event_tx).await })
             })
             .collect::<Vec<_>>();
 
-        let generator =
-            BatchGenerator::new(session.file_queues, self.max_workers, orchestrator.clone());
+        let generator = BatchGenerator::new(file_queues, self.max_workers, health_rx);
 
         for batch in generator {
             debug!(
-                "Processing batch with {} jobs, priority {:?}",
+                "Batch: {} jobs, priority {:?}",
                 batch.jobs.len(),
                 batch.priority
             );
 
             for job in batch.jobs {
-                tx.send(job).await?;
-            }
-
-            match orchestrator.get_buffer_health() {
-                BufferHealth::Critical => {
-                    while tx.len() > 1 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-                    }
-                }
-                BufferHealth::Poor => {
-                    while tx.len() > self.max_workers / 2 {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(25)).await;
-                    }
-                }
-                _ => {
-                    while tx.len() > self.max_workers {
-                        tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
-                    }
+                if tx.send(job).await.is_err() {
+                    info!("Work channel closed, stopping generator.");
+                    break;
                 }
             }
         }
 
         drop(tx);
-        join_all(workers).await;
-        session.writers.close_all().await;
+        futures::future::join_all(workers).await;
+        writers.close_all().await;
 
+        info!("Download complete for session {}", session_id);
         Ok(())
     }
 }
 
-struct Session {
-    file_queues: Vec<FileQueue>,
-    writers: FileWriterPool,
-}
-
-fn spawn_worker(
-    id: usize,
+async fn spawn_worker(
     rx: async_channel::Receiver<batch::Job>,
     client: Arc<NntpClient>,
     writers: FileWriterPool,
-    orchestrator: Arc<StreamOrchestrator>,
-    file_segments: Arc<DashMap<PathBuf, (usize, usize)>>,
-) -> tokio::task::JoinHandle<()> {
-    tokio::spawn(async move {
-        debug!("Worker {} started", id);
-
-        while let Ok(job) = rx.recv().await {
-            match process_job(&job, &client, &writers).await {
-                Ok(_) => {
-                    let path = job.path().clone();
-                    let mut should_notify = false;
-
-                    if let Some(mut entry) = file_segments.get_mut(&path) {
-                        entry.1 += 1; // Increment completed
-                        debug!("File {} progress: {}/{}", path.display(), entry.1, entry.0);
-
-                        if entry.1 == entry.0 {
-                            should_notify = true;
-                            info!("File {} fully downloaded", path.display());
-                        }
-                    }
-
-                    // Notify orchestrator only when file is complete
-                    if should_notify {
-                        if let Err(e) = orchestrator.mark_file_complete(&path).await {
-                            error!("Failed to mark file complete: {}", e);
-                        }
-                    }
-                }
-                Err(e) => {
-                    error!("Worker {} failed: {}", id, e);
-                }
-            }
+    event_tx: mpsc::Sender<OrchestratorEvent>,
+) {
+    while let Ok(job) = rx.recv().await {
+        if let Err(e) = process_job(&job, &client, &writers, &event_tx).await {
+            error!("Worker failed to process job: {}", e);
         }
-
-        debug!("Worker {} finished", id);
-    })
+    }
 }
 
 async fn process_job(
     job: &batch::Job,
     client: &NntpClient,
     writers: &FileWriterPool,
+    event_tx: &mpsc::Sender<OrchestratorEvent>,
 ) -> Result<(), SchedulerError> {
     let data = client.download(job.segment()).await?;
-    writers.write(job.path(), job.index(), data).await?;
+
+    if job.index() == 0 {
+        let is_first = RarExt::from_filename(job.path()).is_some_and(|ext| ext == RarExt::Main);
+        let (data_offset, total_size) = analyse_rar_buffer(&data, is_first).await?;
+
+        event_tx
+            .send(OrchestratorEvent::new(job.path().clone(), total_size))
+            .await?;
+
+        let content = data.slice(data_offset as usize..);
+        writers.write(job.path(), job.index(), content).await?;
+    } else {
+        writers.write(job.path(), job.index(), data).await?;
+    }
+
     Ok(())
 }

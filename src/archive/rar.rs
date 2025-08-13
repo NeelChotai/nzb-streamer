@@ -99,11 +99,11 @@ pub enum RarExt {
 }
 
 impl RarExt {
-    pub fn from_filename(filename: &str) -> Option<Self> {
-        if filename.ends_with(".rar") {
+    pub fn from_filename(filename: &Path) -> Option<Self> {
+        if filename.extension().is_some_and(|ext| ext == "rar") {
             Some(RarExt::Main)
         } else {
-            extract_rar_number(filename).map(RarExt::Part)
+            extract_rar_number(filename.file_name().unwrap().to_str().unwrap()).map(RarExt::Part)
         }
     }
 }

@@ -1,4 +1,5 @@
 use bytes::Bytes;
+use derive_more::Constructor;
 use itertools::Itertools;
 use std::{
     collections::{HashMap, HashSet},
@@ -20,30 +21,31 @@ pub struct FileInfo {
 }
 
 #[derive(Debug)]
-pub enum DownloadTask {
-    New {
-        path: PathBuf,
-        nzb: nzb_rs::File,
-    },
-    FromFirstSegment {
-        path: PathBuf,
-        nzb: nzb_rs::File,
-        data: Bytes,
-    },
+pub enum ArchiveType {
+    Plain,
+    Obfuscated,
+}
+
+#[derive(Debug, Constructor)]
+pub struct DownloadTask {
+    path: PathBuf,
+    nzb: nzb_rs::File,
+    archive_type: ArchiveType,
 }
 
 impl DownloadTask {
     pub fn path(&self) -> &PathBuf {
-        match self {
-            DownloadTask::New { path, .. } => path,
-            DownloadTask::FromFirstSegment { path, .. } => path,
-        }
+        &self.path
     }
 
     pub fn nzb(&self) -> &nzb_rs::File {
-        match self {
-            DownloadTask::New { nzb, .. } => nzb,
-            DownloadTask::FromFirstSegment { nzb, .. } => nzb,
+        &self.nzb
+    }
+
+    pub fn start_segment(&self) -> usize {
+        match self.archive_type {
+            ArchiveType::Plain => 0,
+            ArchiveType::Obfuscated => 1,
         }
     }
 }
@@ -69,20 +71,18 @@ impl Par2Manifest {
 
                 match fs::rename(obfuscated, &path) {
                     // TODO: side effect not clear
-                    Ok(_) => Some(DownloadTask::FromFirstSegment {
+                    Ok(_) => Some(DownloadTask::new(
                         path,
-                        nzb: segment.nzb.clone(),
-                        data: segment.bytes.clone(),
-                    }), // TODO: don't clone
+                        segment.nzb.clone(),
+                        ArchiveType::Obfuscated,
+                    )), // TODO: don't clone
                     Err(e) => {
                         eprintln!("Failed to rename {obfuscated:?} → {path:?}: {e}");
                         None
                     }
                 }
             })
-            .sorted_by_key(|task| {
-                RarExt::from_filename(task.path().file_name().unwrap().to_str().unwrap()).unwrap()
-            })
+            .sorted_by_key(|task| RarExt::from_filename(task.path()).unwrap())
             .collect()
     }
 

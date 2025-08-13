@@ -27,7 +27,7 @@ impl NntpClient {
     }
 
     pub async fn warm_pool(&self) {
-        let target = 20; // TODO: hardcoded for now
+        let target = 50; // TODO: hardcoded for now
         info!("Pre-warming connection pool with {} connections", target);
 
         for i in 0..target {

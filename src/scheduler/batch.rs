@@ -1,9 +1,9 @@
 use crate::scheduler::queue::FileQueue;
-use crate::stream::orchestrator::{BufferHealth, StreamOrchestrator};
+use crate::stream::orchestrator::BufferHealth;
 use derive_more::Constructor;
 use nzb_rs::Segment;
 use std::path::PathBuf;
-use std::sync::Arc;
+use tokio::sync::watch;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Priority {
@@ -22,30 +22,29 @@ impl From<BufferHealth> for Priority {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Constructor)]
 pub struct Job {
     segment: Segment,
     path: PathBuf,
     index: usize,
+    total_segments: usize,
 }
 
 impl Job {
-    pub fn new(segment: Segment, path: PathBuf, index: usize) -> Self {
-        Self {
-            segment,
-            path,
-            index,
-        }
-    }
-
     pub fn segment(&self) -> &Segment {
         &self.segment
     }
+
     pub fn path(&self) -> &PathBuf {
         &self.path
     }
+
     pub fn index(&self) -> usize {
         self.index
+    }
+
+    pub fn total_segments(&self) -> usize {
+        self.total_segments
     }
 }
 
@@ -59,14 +58,10 @@ pub struct Batch {
 pub struct BatchGenerator {
     files: Vec<FileQueue>,
     batch_size: usize,
-    orchestrator: Arc<StreamOrchestrator>,
+    health_rx: watch::Receiver<BufferHealth>,
 }
 
 impl BatchGenerator {
-    fn determine_priority(&self) -> Priority {
-        self.orchestrator.get_buffer_health().into()
-    }
-
     fn generate_batch(&mut self, priority: Priority) -> Option<Batch> {
         let jobs = match priority {
             Priority::Critical => self.take_critical(),
@@ -130,24 +125,7 @@ impl Iterator for BatchGenerator {
     type Item = Batch;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let priority = self.determine_priority();
+        let priority = (*self.health_rx.borrow()).into();
         self.generate_batch(priority)
-    }
-}
-
-pub struct BatchIterator<F> {
-    generator: BatchGenerator,
-    priority_fn: F,
-}
-
-impl<F> Iterator for BatchIterator<F>
-where
-    F: Fn() -> Priority,
-{
-    type Item = Batch;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let priority = (self.priority_fn)();
-        self.generator.generate_batch(priority)
     }
 }

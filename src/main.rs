@@ -10,15 +10,18 @@ use axum::{
 use clap::Parser;
 use http::{HeaderMap, header};
 use nzb_streamer::archive;
-use nzb_streamer::archive::par2::DownloadTask;
+use nzb_streamer::archive::par2::{ArchiveType, DownloadTask};
 use nzb_streamer::nntp::yenc::extract_filename;
 use nzb_streamer::nzb::Nzb;
-use nzb_streamer::stream::orchestrator::StreamOrchestrator;
+use nzb_streamer::scheduler::adaptive::FirstSegment;
+use nzb_streamer::scheduler::error::SchedulerError;
+use nzb_streamer::stream::orchestrator::{BufferHealth, StreamOrchestrator};
 use serde_json::json;
 use std::path;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, mpsc, watch};
+use tokio::task;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -203,11 +206,11 @@ pub async fn stream(
 
     let response = if range.is_some() {
         response
-            .status(StatusCode::OK)
+            .status(StatusCode::PARTIAL_CONTENT)
             .header(header::CACHE_CONTROL, "public, max-age=3600")
     } else {
         response
-            .status(StatusCode::PARTIAL_CONTENT)
+            .status(StatusCode::OK)
             .header(header::CACHE_CONTROL, "no-cache")
     };
 
@@ -232,8 +235,6 @@ pub async fn stream_chunked(
             .unwrap());
     }
 
-    // For chunked encoding, just stream from the beginning
-    // Don't specify Content-Length at all
     let stream = orchestrator.get_stream(0, available, MAX_CHUNK_SIZE).await;
     let body = Body::from_stream(stream);
 
@@ -247,46 +248,25 @@ pub async fn stream_chunked(
 }
 
 fn parse_range_header(headers: &HeaderMap, available_bytes: u64) -> Option<(u64, u64)> {
-    let range_header = headers.get(header::RANGE)?;
-    let range_str = range_header.to_str().ok()?;
-
-    if let Some(range) = range_str.strip_prefix("bytes=") {
-        let parts: Vec<&str> = range.split('-').collect();
-
-        match parts.as_slice() {
-            // Format: "bytes=start-"
-            [start, ""] => {
-                let start = start.parse::<u64>().ok()?;
-                if start >= available_bytes {
-                    return None; // Unsatisfiable range
-                }
-                Some((start, available_bytes - start))
-            }
-            // Format: "bytes=-suffix"
-            ["", suffix] => {
-                let suffix_len = suffix.parse::<u64>().ok()?;
-                // Handle suffix length larger than available bytes
-                let start = available_bytes.saturating_sub(suffix_len);
-                let length = available_bytes - start;
-                if length == 0 {
-                    None // Zero-length range not allowed
-                } else {
-                    Some((start, length))
-                }
-            }
-            // Format: "bytes=start-end"
-            [start, end] => {
-                let start = start.parse::<u64>().ok()?;
-                let end = end.parse::<u64>().ok()?;
-                if start > end || end >= available_bytes {
-                    return None; // Invalid range
-                }
-                Some((start, end - start + 1))
-            }
-            _ => None,
+    let range_str = headers.get(header::RANGE)?.to_str().ok()?;
+    let range = range_str
+        .strip_prefix("bytes=")?
+        .split('-')
+        .collect::<Vec<_>>();
+    match range.as_slice() {
+        [start, ""] => {
+            let start = start.parse().ok()?;
+            Some((start, available_bytes - start))
         }
-    } else {
-        None
+        [start, end] => {
+            let start = start.parse().ok()?;
+            let end = end.parse().ok()?;
+            if start > end {
+                return None;
+            }
+            Some((start, end - start + 1))
+        }
+        _ => None,
     }
 }
 
@@ -318,15 +298,17 @@ async fn upload(
 
     let tasks = if !nzb.obfuscated.is_empty() {
         info!("NZB contains obfuscated files, decoding");
-        obfuscated(nzb, &state, &session_dir).await
+        obfuscated(nzb, &state.scheduler, &session_dir).await
     } else {
         info!("NZB contains plain RAR files, serving");
-        plain(nzb, &session_dir)
+        plain(nzb, &state.scheduler, &session_dir).await
     }?;
 
     let paths: Vec<_> = tasks.iter().map(|segment| segment.path().clone()).collect();
+    let (health_tx, health_rx) = watch::channel(BufferHealth::Critical);
+    let (event_tx, event_rx) = mpsc::channel(100); // TODO: number
 
-    let orchestrator = Arc::new(StreamOrchestrator::new(&paths).await.unwrap());
+    let orchestrator = StreamOrchestrator::new(&paths, event_rx, health_tx);
     state
         .sessions
         .write()
@@ -342,7 +324,7 @@ async fn upload(
             );
 
             scheduler
-                .schedule_downloads(tasks, session_id, orchestrator)
+                .schedule_downloads(tasks, session_id, event_tx, health_rx)
                 .await
                 .unwrap();
 
@@ -362,29 +344,20 @@ async fn upload(
 
 async fn obfuscated(
     nzb: Nzb,
-    state: &AppState,
+    scheduler: &Arc<AdaptiveScheduler>,
     session_dir: &path::Path,
 ) -> Result<Vec<DownloadTask>, RestError> {
+    let first_segments = download_first_segments(scheduler, session_dir, nzb.obfuscated).await;
+
     info!("Downloading main PAR2 file");
     // TODO: this operates on the assumption that the par2 file is one segment
     let par2_target = nzb.par2.first().unwrap().clone();
-    let main_par2 = state
-        .scheduler
+    let main_par2 = scheduler
         .download_first_segment(par2_target, session_dir)
         .await
         .unwrap();
 
-    info!("Background downloading first RAR segments");
-    let first_segments = tokio::spawn({
-        let scheduler = Arc::clone(&state.scheduler);
-        let dir = session_dir.to_path_buf();
-        let rars = nzb.obfuscated.clone();
-        async move {
-            scheduler.download_first_segments(&rars, &dir).await // TODO: handle files that are actually rar
-        }
-    });
-
-    let manifest = archive::parse_file(&main_par2.path)?; // TODO: wasteful to write in download_first_segment, then immediately read here
+    let manifest = archive::parse_buffer(&main_par2.bytes)?; // TODO: wasteful to write in download_first_segment, then immediately read here
 
     info!("Waiting for first segment downloads to complete");
     let first_segments = first_segments.await??;
@@ -406,19 +379,45 @@ async fn obfuscated(
     Ok(tasks)
 }
 
-fn plain(nzb: Nzb, session_dir: &path::Path) -> Result<Vec<DownloadTask>, RestError> {
+async fn plain(
+    nzb: Nzb,
+    scheduler: &Arc<AdaptiveScheduler>,
+    session_dir: &path::Path,
+) -> Result<Vec<DownloadTask>, RestError> {
+    // TODO: download first segments
+    // build the memmap
+    // then create download tasks as above
+    let first_segments = download_first_segments(scheduler, session_dir, nzb.rar.clone()).await;
+
     info!("Background downloading RAR files");
     let tasks: Vec<_> = nzb
         .rar
         .iter()
-        .map(|file| DownloadTask::New {
-            path: session_dir.join(extract_filename(&file.subject)),
-            nzb: file.clone(),
+        .map(|file| {
+            DownloadTask::new(
+                session_dir.join(extract_filename(&file.subject)),
+                file.clone(),
+                ArchiveType::Plain,
+            )
         })
         .collect();
     info!("Created {} download tasks", tasks.len());
 
     Ok(tasks)
+}
+
+async fn download_first_segments(
+    scheduler: &Arc<AdaptiveScheduler>,
+    session_dir: &path::Path,
+    rars: Vec<nzb_rs::File>,
+) -> task::JoinHandle<Result<Vec<FirstSegment>, SchedulerError>> {
+    info!("Background downloading first RAR segments");
+
+    tokio::spawn({
+        let scheduler = Arc::clone(scheduler);
+        let dir = session_dir.to_path_buf();
+        async move { scheduler.download_first_segments(&rars, &dir).await }
+    })
 }
 
 // right now we match on first file

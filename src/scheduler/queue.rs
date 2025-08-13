@@ -23,7 +23,7 @@ impl FileQueue {
             .into_iter()
             .enumerate()
             .skip(start_index)
-            .map(|(idx, segment)| Job::new(segment, path.clone(), idx))
+            .map(|(idx, segment)| Job::new(segment, path.clone(), idx, total))
             .collect();
 
         Ok(Self {

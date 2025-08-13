@@ -1,15 +1,22 @@
 // TODO: needs to be stubbed out for the actual orchastrator class
 
-use dashmap::DashMap;
+use arc_swap::ArcSwap;
+use bytes::Bytes;
+use derive_more::Constructor;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use tokio::sync::RwLock;
-use tracing::{debug, info};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::sync::{mpsc, watch};
+use tracing::{debug, error, info};
 
-use crate::archive::rar::analyse_rar_volume;
 use crate::stream::error::StreamError;
-use crate::stream::virtual_file_streamer::{FileLayout, VirtualFileStreamer};
+use crate::stream::virtual_file_streamer::{FileLayout, read_range_with_chunk_size};
+
+#[derive(Debug, Clone, Constructor)]
+pub struct OrchestratorEvent {
+    path: PathBuf,
+    total_size: u64,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BufferHealth {
@@ -19,187 +26,163 @@ pub enum BufferHealth {
     Excellent,
 }
 
-#[derive(Debug, Clone)]
-struct FileState {
-    index: usize,
-    path: PathBuf,
-    is_complete: bool,
-    rar_start: u64,
-    rar_length: u64,
-}
-
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct StreamOrchestrator {
-    files: Arc<DashMap<PathBuf, FileState>>,
-    layout: Arc<RwLock<Vec<FileLayout>>>,
-    streamer: Arc<VirtualFileStreamer>,
-    total_files: usize,
-    complete_files: AtomicUsize,
-    available_bytes: AtomicU64,
-    playback_position: AtomicUsize,
+    files: Arc<Vec<(PathBuf, parking_lot::RwLock<u64>)>>,
+    layout: Arc<ArcSwap<Vec<FileLayout>>>,
+    playback_position: Arc<AtomicU64>,
+    health_tx: watch::Sender<BufferHealth>,
 }
 
 impl StreamOrchestrator {
-    pub async fn new(sorted_paths: &[PathBuf]) -> Result<Self, StreamError> {
-        let total_files = sorted_paths.len();
-
-        // Initialize file states
-        let files: DashMap<PathBuf, FileState> = sorted_paths
+    pub fn new(
+        sorted_paths: &[PathBuf],
+        mut event_rx: mpsc::Receiver<OrchestratorEvent>,
+        health_tx: watch::Sender<BufferHealth>,
+    ) -> Arc<Self> {
+        let files: Vec<_> = sorted_paths
             .iter()
-            .enumerate()
-            .map(|(idx, path)| {
-                (
-                    path.clone(),
-                    FileState {
-                        index: idx,
-                        path: path.clone(),
-                        is_complete: false, // Nothing is complete initially
-                        rar_start: 0,
-                        rar_length: 0,
-                    },
-                )
-            })
+            .map(|path| (path.clone(), parking_lot::RwLock::new(0)))
             .collect();
 
-        let layout = vec![];
-        let streamer = Arc::new(VirtualFileStreamer::new());
-
-        Ok(Self {
+        let orchestrator = Arc::new(Self {
             files: Arc::new(files),
-            layout: Arc::new(RwLock::new(layout)),
-            streamer,
-            total_files,
-            complete_files: AtomicUsize::new(0),
-            available_bytes: AtomicU64::new(0),
-            playback_position: AtomicUsize::new(0),
-        })
-    }
-
-    pub async fn mark_file_complete(&self, path: &PathBuf) -> Result<(), StreamError> {
-        let file_state = self
-            .files
-            .get(path)
-            .ok_or_else(|| StreamError::FileNotFound(path.to_path_buf()))?;
-
-        let index = file_state.index;
-        let is_first = index == 0;
-
-        // Analyse RAR volume
-        let (rar_start, rar_length) = analyse_rar_volume(path, is_first).await?;
-
-        // Update file state
-        drop(file_state); // Release read lock
-        self.files.alter(path, |_, mut state| {
-            state.is_complete = true;
-            state.rar_start = rar_start;
-            state.rar_length = rar_length;
-            state
+            layout: Arc::new(ArcSwap::new(Arc::new(Vec::new()))),
+            playback_position: Arc::new(AtomicU64::new(0)),
+            health_tx,
         });
 
-        self.complete_files.fetch_add(1, Ordering::Relaxed);
+        let background = Arc::clone(&orchestrator);
+        tokio::spawn(async move {
+            info!("Orchestrator metadata listener started");
+            while let Some(event) = event_rx.recv().await {
+                background.handle_worker_event(event).await;
+                background.update_layout();
+            }
+            info!("Orchestrator metadata listener stopped.");
+        });
 
-        // Rebuild layout if needed
-        self.rebuild_layout_if_continuous().await;
-
-        info!(
-            "File {} complete: {} bytes (progress: {}/{})",
-            path.display(),
-            rar_length,
-            self.complete_files.load(Ordering::Relaxed),
-            self.total_files
-        );
-
-        Ok(())
+        orchestrator
     }
 
-    async fn rebuild_layout_if_continuous(&self) {
-        let mut states: Vec<FileState> = self
+    async fn handle_worker_event(&self, event: OrchestratorEvent) {
+        if let Some((_, size_lock)) = self.files.iter().find(|(p, _)| p == &event.path) {
+            info!(
+                "Metadata received for {}: total size = {}",
+                event.path.display(),
+                event.total_size
+            );
+            let mut size = size_lock.write();
+            if *size == 0 {
+                *size = event.total_size;
+
+                self.update_layout();
+            }
+        } else {
+            error!(
+                "Received metadata for unknown file: {}",
+                event.path.display()
+            );
+        }
+    }
+
+    fn update_layout(&self) {
+        let mut layouts = Vec::new();
+        let mut virtual_offset = 0u64;
+        for (path, size_lock) in self.files.iter() {
+            let total_size = *size_lock.read();
+            if total_size > 0 {
+                layouts.push(FileLayout {
+                    path: path.clone(),
+                    length: total_size,
+                    virtual_start: virtual_offset,
+                });
+                virtual_offset += total_size;
+            }
+        }
+
+        if !layouts.is_empty() {
+            debug!(
+                "Layout updated: {} bytes across {} files",
+                virtual_offset,
+                layouts.len()
+            );
+            self.layout.store(Arc::new(layouts));
+        }
+    }
+
+    fn health_check(&self) {
+        let playback_pos = self.playback_position.load(Ordering::SeqCst);
+
+        let buffer_bytes = self
             .files
             .iter()
-            .map(|entry| entry.value().clone())
-            .collect();
+            .try_fold(0u64, |acc, (path, size_lock)| {
+                let total_size = *size_lock.read();
 
-        states.sort_by_key(|s| s.index);
+                match total_size {
+                    0 => Err(acc), // unknown file size -> stop
+                    _ => match std::fs::metadata(path) {
+                        Err(_) => Err(acc), // file missing -> stop
+                        Ok(metadata) => {
+                            let disk_size = metadata.len();
+                            if disk_size >= total_size {
+                                Ok(acc + total_size) // fully downloaded -> continue
+                            } else {
+                                Err(acc + disk_size) // partial -> stop
+                            }
+                        }
+                    },
+                }
+            })
+            .unwrap_or_else(|acc| acc);
 
-        let continuous_files: Vec<FileState> =
-            states.into_iter().take_while(|s| s.is_complete).collect();
-
-        if continuous_files.is_empty() {
+        if buffer_bytes == 0 {
+            self.health_tx.send(BufferHealth::Critical).unwrap();
             return;
         }
 
-        // Build new layout
-        let mut virtual_offset = 0u64;
-        let new_layout: Vec<FileLayout> = continuous_files
-            .iter()
-            .map(|state| {
-                let layout = FileLayout {
-                    path: state.path.clone(),
-                    start: state.rar_start,
-                    length: state.rar_length,
-                    virtual_start: virtual_offset,
-                };
-                virtual_offset += state.rar_length;
-                layout
-            })
-            .collect();
+        let buffer_ahead_bytes = buffer_bytes.saturating_sub(playback_pos);
+        let buffer_mb = buffer_ahead_bytes / (1024 * 1024);
 
-        // Update available bytes
-        self.available_bytes
-            .store(virtual_offset, Ordering::Relaxed);
+        let health = match buffer_mb {
+            0..=100 => BufferHealth::Critical,
+            101..=500 => BufferHealth::Poor,
+            501..=1024 => BufferHealth::Good,
+            _ => BufferHealth::Excellent,
+        };
 
-        // Atomically update layout
-        *self.layout.write().await = new_layout;
-
-        debug!("Layout updated: {} bytes available", virtual_offset);
+        debug!(
+            "Health check: {}MB buffer ahead. Status: {:?}",
+            buffer_mb, health
+        );
+        self.health_tx.send(health).unwrap();
     }
 
     pub fn update_playback_position(&self, byte_position: u64) {
-        // TODO: rough estimate: assume ~700MB per file, we should be smarter about this
-        let estimated_file = (byte_position / (700 * 1024 * 1024)) as usize;
         self.playback_position
-            .store(estimated_file, Ordering::Relaxed);
-        debug!("Playback approximately at file {}", estimated_file);
-    }
-
-    pub fn get_buffer_health(&self) -> BufferHealth {
-        // TODO: just take segments.last?
-        let playback = self.playback_position.load(Ordering::Relaxed);
-        let complete = self.complete_files.load(Ordering::Relaxed);
-        let buffer = complete.saturating_sub(playback);
-
-        match buffer {
-            0..=2 => BufferHealth::Critical,
-            3..=5 => BufferHealth::Poor,
-            6..=10 => BufferHealth::Good,
-            _ => BufferHealth::Excellent,
-        }
-    }
-
-    pub fn get_priority_index(&self) -> usize {
-        self.playback_position.load(Ordering::Relaxed) + 3 // TODO: hardcoded 3 file buffer for now
+            .store(byte_position, Ordering::SeqCst);
     }
 
     pub fn get_available_bytes(&self) -> u64 {
-        self.available_bytes.load(Ordering::Relaxed)
-    }
-
-    pub fn complete_count(&self) -> usize {
-        self.complete_files.load(Ordering::Relaxed)
+        self.layout
+            .load()
+            .last()
+            .map(|f| f.virtual_start + f.length)
+            .unwrap_or(0)
     }
 
     pub async fn get_stream(
-        &self,
+        self: &Arc<Self>,
         start: u64,
         length: u64,
         chunk_size: usize,
-    ) -> impl futures::Stream<Item = Result<bytes::Bytes, StreamError>> + 'static {
-        // Update playback position
+    ) -> impl futures::Stream<Item = Result<Bytes, StreamError>> + 'static {
         self.update_playback_position(start);
-        let layout = self.layout.read().await.clone();
+        self.health_check();
+        self.update_layout();
 
-        // Delegate to streamer
-        self.streamer
-            .read_range_with_chunk_size(start, length, chunk_size, layout)
+        let layout = self.layout.load_full();
+        read_range_with_chunk_size(start, length, chunk_size, layout.to_vec())
     }
 }

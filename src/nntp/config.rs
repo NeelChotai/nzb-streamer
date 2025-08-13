@@ -26,7 +26,7 @@ pub struct MaxConnections(usize);
 
 impl Default for MaxConnections {
     fn default() -> Self {
-        const DEFAULT: usize = 20;
+        const DEFAULT: usize = 50;
         warn!("Max connections not provided. Using default ({}).", DEFAULT);
         MaxConnections(DEFAULT)
     }
