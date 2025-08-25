@@ -1,4 +1,3 @@
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::nntp::pool::NntpPool;
@@ -14,15 +13,13 @@ use tokio::time;
 use tracing::{debug, info, warn};
 
 pub struct NntpClient {
-    pool: Arc<NntpPool>,
+    pool: NntpPool,
 }
 
 impl NntpClient {
     pub fn new(config: NntpConfig) -> Result<Self, NntpError> {
-        let pool = NntpPool::new(config)?;
-
         Ok(Self {
-            pool: Arc::new(pool),
+            pool: NntpPool::new(config)?,
         })
     }
 
@@ -32,11 +29,11 @@ impl NntpClient {
 
         for i in 0..target {
             tokio::spawn({
-                let client = Arc::clone(&self.pool);
+                let client = self.pool.clone();
                 async move {
                     time::sleep(Duration::from_millis(i as u64 * 50)).await;
 
-                    match client.0.get().await {
+                    match client.get().await {
                         Ok(_) => {
                             debug!("Pre-warmed connection {}", i);
                         }
@@ -76,7 +73,7 @@ impl NntpClient {
             .await
             .map_err(|e| NntpError::Read(e.to_string()))?; // TODO: permenant error
 
-        drop(conn); // TODO: quit logic when dropping connection (this is recycle though)
+        //drop(conn); // TODO: quit logic when dropping connection (this is recycle though)
 
         let yenc_data = extract_yenc_data(&raw_data);
         let decoded = yenc::decode_buffer(&yenc_data).unwrap(); // TODO: permenant error

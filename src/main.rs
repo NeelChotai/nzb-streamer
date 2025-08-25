@@ -9,9 +9,8 @@ use axum::{
 };
 use clap::Parser;
 use http::{HeaderMap, header};
-use nzb_streamer::archive;
-use nzb_streamer::archive::par2::{ArchiveType, DownloadTask};
-use nzb_streamer::nntp::yenc::extract_filename;
+use nzb_streamer::archive::par2::{DownloadTask, create_download_tasks};
+use nzb_streamer::archive::{self, par2};
 use nzb_streamer::nzb::Nzb;
 use nzb_streamer::scheduler::adaptive::FirstSegment;
 use nzb_streamer::scheduler::error::SchedulerError;
@@ -20,7 +19,7 @@ use serde_json::json;
 use std::path;
 use std::{collections::HashMap, path::PathBuf, sync::Arc};
 use tokio::net::TcpListener;
-use tokio::sync::{RwLock, mpsc, watch};
+use tokio::sync::{RwLock, watch};
 use tokio::task;
 use tower_http::cors::CorsLayer;
 use tracing::{info, warn};
@@ -304,11 +303,9 @@ async fn upload(
         plain(nzb, &state.scheduler, &session_dir).await
     }?;
 
-    let paths: Vec<_> = tasks.iter().map(|segment| segment.path().clone()).collect();
     let (health_tx, health_rx) = watch::channel(BufferHealth::Critical);
-    let (event_tx, event_rx) = mpsc::channel(100); // TODO: number
 
-    let orchestrator = StreamOrchestrator::new(&paths, event_rx, health_tx);
+    let orchestrator = StreamOrchestrator::new(tasks.clone(), &session_dir, health_tx);
     state
         .sessions
         .write()
@@ -317,14 +314,15 @@ async fn upload(
 
     tokio::spawn({
         let scheduler = Arc::clone(&state.scheduler);
+        let mmap = Arc::clone(&orchestrator.mmap);
         async move {
             info!(
                 "Starting background download of remaining segments for {} RAR files",
-                paths.len()
+                tasks.len()
             );
 
             scheduler
-                .schedule_downloads(tasks, session_id, event_tx, health_rx)
+                .schedule_downloads(tasks, mmap, health_rx)
                 .await
                 .unwrap();
 
@@ -347,23 +345,21 @@ async fn obfuscated(
     scheduler: &Arc<AdaptiveScheduler>,
     session_dir: &path::Path,
 ) -> Result<Vec<DownloadTask>, RestError> {
-    let first_segments = download_first_segments(scheduler, session_dir, nzb.obfuscated).await;
+    let first_segments = download_first_segments(scheduler, nzb.obfuscated).await;
 
     info!("Downloading main PAR2 file");
     // TODO: this operates on the assumption that the par2 file is one segment
     let par2_target = nzb.par2.first().unwrap().clone();
-    let main_par2 = scheduler
-        .download_first_segment(par2_target, session_dir)
-        .await
-        .unwrap();
+    let main_par2 = scheduler.download_first_segment(par2_target).await.unwrap();
 
-    let manifest = archive::parse_buffer(&main_par2.bytes)?; // TODO: wasteful to write in download_first_segment, then immediately read here
+    let manifest = archive::parse_buffer(&main_par2.bytes)?;
 
     info!("Waiting for first segment downloads to complete");
     let first_segments = first_segments.await??;
     info!("Downloaded {} first segments", first_segments.len());
 
-    let tasks = manifest.create_download_tasks(&first_segments);
+    let tasks =
+        create_download_tasks(manifest.hash_to_filename(), &first_segments, session_dir).await?;
     info!("Created {} download tasks", tasks.len());
 
     let downloaded_hashes: Vec<_> = first_segments
@@ -384,23 +380,10 @@ async fn plain(
     scheduler: &Arc<AdaptiveScheduler>,
     session_dir: &path::Path,
 ) -> Result<Vec<DownloadTask>, RestError> {
-    // TODO: download first segments
-    // build the memmap
-    // then create download tasks as above
-    let first_segments = download_first_segments(scheduler, session_dir, nzb.rar.clone()).await;
+    let first_segments = download_first_segments(scheduler, nzb.rar.clone()).await;
+    let segments = first_segments.await??;
 
-    info!("Background downloading RAR files");
-    let tasks: Vec<_> = nzb
-        .rar
-        .iter()
-        .map(|file| {
-            DownloadTask::new(
-                session_dir.join(extract_filename(&file.subject)),
-                file.clone(),
-                ArchiveType::Plain,
-            )
-        })
-        .collect();
+    let tasks = par2::create_download_tasks_plain(&segments, session_dir).await?;
     info!("Created {} download tasks", tasks.len());
 
     Ok(tasks)
@@ -408,15 +391,13 @@ async fn plain(
 
 async fn download_first_segments(
     scheduler: &Arc<AdaptiveScheduler>,
-    session_dir: &path::Path,
     rars: Vec<nzb_rs::File>,
 ) -> task::JoinHandle<Result<Vec<FirstSegment>, SchedulerError>> {
     info!("Background downloading first RAR segments");
 
     tokio::spawn({
         let scheduler = Arc::clone(scheduler);
-        let dir = session_dir.to_path_buf();
-        async move { scheduler.download_first_segments(&rars, &dir).await }
+        async move { scheduler.download_first_segments(&rars).await }
     })
 }
 

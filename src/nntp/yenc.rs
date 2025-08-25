@@ -1,18 +1,14 @@
 use bytes::Bytes;
 use md5::{Digest, Md5};
 
-pub fn extract_filename(subject: &str) -> String {
+pub fn extract_filename(subject: &str) -> Option<&str> {
     if let Some(start) = subject.find('"') {
         if let Some(end) = subject[start + 1..].find('"') {
-            return subject[start + 1..start + 1 + end].to_string();
+            return Some(&subject[start + 1..start + 1 + end]);
         }
     }
 
-    subject
-        .split_whitespace()
-        .next()
-        .unwrap_or("unknown")
-        .to_string()
+    subject.split_whitespace().next()
 }
 
 pub fn extract_yenc_data(article: &[u8]) -> Bytes {

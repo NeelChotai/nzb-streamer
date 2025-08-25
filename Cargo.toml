@@ -51,6 +51,10 @@ arc-swap = "1.7.1"
 parking_lot = "0.12.4"
 md-5 = "0.10.6"
 ordered-stream = "0.2.0"
+memmap2 = "0.9.7"
+rustix = { version = "1.0.8", features = ["fs"] }
+drill-press = "0.1.2"
+tokio-stream = "0.1.17"
 
 [dev-dependencies]
 tempfile = "3"

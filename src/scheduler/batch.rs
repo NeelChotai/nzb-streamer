@@ -1,9 +1,9 @@
-use crate::scheduler::queue::FileQueue;
+use crate::archive::par2::DownloadTask;
 use crate::stream::orchestrator::BufferHealth;
 use derive_more::Constructor;
-use nzb_rs::Segment;
-use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::sync::watch;
+use tracing::debug;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Priority {
@@ -24,99 +24,55 @@ impl From<BufferHealth> for Priority {
 
 #[derive(Debug, Clone, Constructor)]
 pub struct Job {
-    segment: Segment,
-    path: PathBuf,
-    index: usize,
-    total_segments: usize,
-}
-
-impl Job {
-    pub fn segment(&self) -> &Segment {
-        &self.segment
-    }
-
-    pub fn path(&self) -> &PathBuf {
-        &self.path
-    }
-
-    pub fn index(&self) -> usize {
-        self.index
-    }
-
-    pub fn total_segments(&self) -> usize {
-        self.total_segments
-    }
+    pub task: Arc<DownloadTask>,
+    pub offset: u64,
 }
 
 #[derive(Debug)]
 pub struct Batch {
     pub jobs: Vec<Job>,
-    pub priority: Priority,
+    pub health: BufferHealth,
 }
 
-#[derive(Debug, Constructor)]
+#[derive(Debug)]
 pub struct BatchGenerator {
-    files: Vec<FileQueue>,
-    batch_size: usize,
+    jobs: Vec<Job>,
+    consumed: Vec<bool>,
     health_rx: watch::Receiver<BufferHealth>,
 }
 
 impl BatchGenerator {
-    fn generate_batch(&mut self, priority: Priority) -> Option<Batch> {
-        let jobs = match priority {
-            Priority::Critical => self.take_critical(),
-            Priority::Balanced => self.take_balanced(),
-            Priority::Parallel => self.take_parallel(),
-        };
+    pub fn new(tasks: Vec<DownloadTask>, health_rx: watch::Receiver<BufferHealth>) -> Self {
+        let mut offset = tasks.first().unwrap().bytes().len();
+        let mut jobs = Vec::new();
+        for task in tasks.into_iter().skip(1) {
+            // skip first
+            let length = task.bytes().len();
+            println!("Writing {} bytes at offset {}", task.bytes().len(), offset);
 
-        (!jobs.is_empty()).then_some(Batch { jobs, priority })
-    }
+            let job = Job {
+                task: task.into(),
+                offset: offset as u64,
+            };
+            jobs.push(job);
+            offset += length;
+        }
 
-    fn take_critical(&mut self) -> Vec<Job> {
-        self.files
-            .iter_mut()
-            .find(|f| !f.is_empty())
-            .map(|f| f.take(self.batch_size))
-            .unwrap_or_default()
-    }
+        let consumed = vec![false; jobs.len()];
 
-    fn take_balanced(&mut self) -> Vec<Job> {
-        const FILES_PER_WAVE: usize = 3;
-        let per_file = self.batch_size / FILES_PER_WAVE;
-
-        let jobs: Vec<_> = self
-            .files
-            .iter_mut()
-            .filter(|f| !f.is_empty())
-            .take(FILES_PER_WAVE)
-            .flat_map(|f| f.take(per_file))
-            .collect();
-
-        if jobs.len() < self.batch_size / 2 {
-            let remaining = self.batch_size - jobs.len();
-            let extra: Vec<_> = self
-                .files
-                .iter_mut()
-                .filter(|f| !f.is_empty())
-                .flat_map(|f| f.take(remaining))
-                .collect();
-            [jobs, extra].concat()
-        } else {
-            jobs
+        Self {
+            jobs,
+            consumed,
+            health_rx,
         }
     }
 
-    fn take_parallel(&mut self) -> Vec<Job> {
-        let active = self.files.iter().filter(|f| !f.is_empty()).count();
-        if active == 0 {
-            return Vec::new();
-        }
-
-        let per_file = (self.batch_size / active).max(1);
-        self.files
-            .iter_mut()
-            .filter(|f| !f.is_empty())
-            .flat_map(|f| f.take(per_file))
+    /// Get indices of available (not consumed) jobs
+    fn available_indices(&self) -> Vec<usize> {
+        self.consumed
+            .iter()
+            .enumerate()
+            .filter_map(|(i, &consumed)| (!consumed).then_some(i))
             .collect()
     }
 }
@@ -125,7 +81,46 @@ impl Iterator for BatchGenerator {
     type Item = Batch;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let priority = (*self.health_rx.borrow()).into();
-        self.generate_batch(priority)
+        let available = self.available_indices();
+        if available.is_empty() {
+            return None;
+        }
+
+        let health = *self.health_rx.borrow();
+        let concurrent = health.concurrent_jobs(available.len());
+
+        // Select indices based on strategy
+        let selected_indices: Vec<_> = match health {
+            BufferHealth::Critical | BufferHealth::Poor => {
+                // Sequential: take first N available
+                available.into_iter().take(concurrent).collect()
+            }
+            BufferHealth::Good | BufferHealth::Excellent => {
+                // Distributed: sample evenly from available
+                let step = available.len() / concurrent.max(1);
+                if step <= 1 {
+                    available.into_iter().take(concurrent).collect()
+                } else {
+                    (0..concurrent).map(|i| available[i * step]).collect()
+                }
+            }
+        };
+
+        // Mark as consumed and collect jobs
+        let jobs: Vec<Job> = selected_indices
+            .into_iter()
+            .map(|i| {
+                self.consumed[i] = true;
+                self.jobs[i].clone()
+            })
+            .collect();
+
+        debug!(
+            "Generated batch of {} jobs (health: {:?})",
+            jobs.len(),
+            health
+        );
+
+        Some(Batch { jobs, health })
     }
 }

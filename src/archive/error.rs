@@ -16,4 +16,7 @@ pub enum ArchiveError {
 
     #[error("RAR signature not found in buffer")]
     MalformedRar,
+
+    #[error("Could not create download task for subject {0}")]
+    FilenameNotFound(String),
 }

@@ -1,22 +1,17 @@
-// TODO: needs to be stubbed out for the actual orchastrator class
-
-use arc_swap::ArcSwap;
 use bytes::Bytes;
-use derive_more::Constructor;
-use std::path::PathBuf;
+use futures::Stream;
+use memmap2::MmapMut;
+use parking_lot::RwLock;
+use rustix::fs::{SeekFrom, seek};
+use std::fs::File;
+use std::os::fd::AsFd;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use tokio::sync::{mpsc, watch};
-use tracing::{debug, error, info};
+use tokio::sync::watch;
 
+use crate::archive::par2::DownloadTask;
 use crate::stream::error::StreamError;
-use crate::stream::virtual_file_streamer::{FileLayout, read_range_with_chunk_size};
-
-#[derive(Debug, Clone, Constructor)]
-pub struct OrchestratorEvent {
-    path: PathBuf,
-    total_size: u64,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum BufferHealth {
@@ -26,150 +21,152 @@ pub enum BufferHealth {
     Excellent,
 }
 
+impl BufferHealth {
+    /// How many parts to process concurrently
+    pub fn concurrent_jobs(&self, total_jobs: usize) -> usize {
+        match self {
+            Self::Critical => 1,
+            Self::Poor => 2,
+            Self::Good => 4,
+            Self::Excellent => total_jobs,
+        }
+    }
+
+    pub fn segment_parallelism(&self, max_workers: usize, concurrent_parts: usize) -> usize {
+        let workers_per_job = max_workers / concurrent_parts.max(1);
+
+        match self {
+            Self::Critical => max_workers,
+            Self::Poor => workers_per_job,
+            Self::Good => workers_per_job,
+            Self::Excellent => workers_per_job,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct StreamOrchestrator {
-    files: Arc<Vec<(PathBuf, parking_lot::RwLock<u64>)>>,
-    layout: Arc<ArcSwap<Vec<FileLayout>>>,
+    pub mmap: Arc<RwLock<MmapMut>>,
+    file: Arc<File>,
+    total_size: u64,
     playback_position: Arc<AtomicU64>,
     health_tx: watch::Sender<BufferHealth>,
 }
 
 impl StreamOrchestrator {
     pub fn new(
-        sorted_paths: &[PathBuf],
-        mut event_rx: mpsc::Receiver<OrchestratorEvent>,
+        tasks: Vec<DownloadTask>,
+        session_dir: &Path,
         health_tx: watch::Sender<BufferHealth>,
     ) -> Arc<Self> {
-        let files: Vec<_> = sorted_paths
-            .iter()
-            .map(|path| (path.clone(), parking_lot::RwLock::new(0)))
-            .collect();
+        // let files: Vec<_> = tasks
+        //     .iter()
+        //     .map(|segment| (segment.path().clone(), parking_lot::RwLock::new(0)))
+        //     .collect();
+        let total_size: u64 = tasks.iter().map(|f| f.length()).sum();
 
-        let orchestrator = Arc::new(Self {
-            files: Arc::new(files),
-            layout: Arc::new(ArcSwap::new(Arc::new(Vec::new()))),
-            playback_position: Arc::new(AtomicU64::new(0)),
+        let path = session_dir.join("test.mkv");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
+        file.set_len(total_size).unwrap();
+        let mut mmap = unsafe { MmapMut::map_mut(&file).unwrap() };
+
+        let mut offset = 0;
+        for task in tasks {
+            println!("Writing {} bytes at offset {}", task.bytes().len(), offset);
+
+            let end = offset + task.bytes().len();
+
+            // Write the task's data to the correct offset in the memory map
+            mmap[offset..end].copy_from_slice(task.bytes());
+            offset += *task.length() as usize;
+        }
+
+        mmap.flush().unwrap();
+
+        Arc::new(Self {
+            mmap: Arc::new(RwLock::new(mmap)),
+            file: Arc::new(file),
+            total_size,
+            playback_position: AtomicU64::new(0).into(),
             health_tx,
-        });
-
-        let background = Arc::clone(&orchestrator);
-        tokio::spawn(async move {
-            info!("Orchestrator metadata listener started");
-            while let Some(event) = event_rx.recv().await {
-                background.handle_worker_event(event).await;
-                background.update_layout();
-            }
-            info!("Orchestrator metadata listener stopped.");
-        });
-
-        orchestrator
+        })
     }
 
-    async fn handle_worker_event(&self, event: OrchestratorEvent) {
-        if let Some((_, size_lock)) = self.files.iter().find(|(p, _)| p == &event.path) {
-            info!(
-                "Metadata received for {}: total size = {}",
-                event.path.display(),
-                event.total_size
-            );
-            let mut size = size_lock.write();
-            if *size == 0 {
-                *size = event.total_size;
-
-                self.update_layout();
-            }
-        } else {
-            error!(
-                "Received metadata for unknown file: {}",
-                event.path.display()
-            );
-        }
-    }
-
-    fn update_layout(&self) {
-        let mut layouts = Vec::new();
-        let mut virtual_offset = 0u64;
-        for (path, size_lock) in self.files.iter() {
-            let total_size = *size_lock.read();
-            if total_size > 0 {
-                layouts.push(FileLayout {
-                    path: path.clone(),
-                    length: total_size,
-                    virtual_start: virtual_offset,
-                });
-                virtual_offset += total_size;
-            }
-        }
-
-        if !layouts.is_empty() {
-            debug!(
-                "Layout updated: {} bytes across {} files",
-                virtual_offset,
-                layouts.len()
-            );
-            self.layout.store(Arc::new(layouts));
-        }
-    }
-
-    fn health_check(&self) {
+    fn update_health(&self) {
         let playback_pos = self.playback_position.load(Ordering::SeqCst);
+        let available = self.get_available_bytes();
+        let buffer_ahead = available.saturating_sub(playback_pos);
 
-        let buffer_bytes = self
-            .files
-            .iter()
-            .try_fold(0u64, |acc, (path, size_lock)| {
-                let total_size = *size_lock.read();
-
-                match total_size {
-                    0 => Err(acc), // unknown file size -> stop
-                    _ => match std::fs::metadata(path) {
-                        Err(_) => Err(acc), // file missing -> stop
-                        Ok(metadata) => {
-                            let disk_size = metadata.len();
-                            if disk_size >= total_size {
-                                Ok(acc + total_size) // fully downloaded -> continue
-                            } else {
-                                Err(acc + disk_size) // partial -> stop
-                            }
-                        }
-                    },
-                }
-            })
-            .unwrap_or_else(|acc| acc);
-
-        if buffer_bytes == 0 {
-            self.health_tx.send(BufferHealth::Critical).unwrap();
-            return;
-        }
-
-        let buffer_ahead_bytes = buffer_bytes.saturating_sub(playback_pos);
-        let buffer_mb = buffer_ahead_bytes / (1024 * 1024);
-
-        let health = match buffer_mb {
-            0..=100 => BufferHealth::Critical,
-            101..=500 => BufferHealth::Poor,
-            501..=1024 => BufferHealth::Good,
-            _ => BufferHealth::Excellent,
+        // Percentage of remaining video buffered
+        let remaining = self.total_size.saturating_sub(playback_pos);
+        let buffer_percentage = if remaining > 0 {
+            (buffer_ahead * 100) / remaining
+        } else {
+            100
         };
 
-        debug!(
-            "Health check: {}MB buffer ahead. Status: {:?}",
-            buffer_mb, health
-        );
-        self.health_tx.send(health).unwrap();
+        let health = match buffer_percentage {
+            0..=5 => BufferHealth::Critical, // <5% buffered
+            6..=15 => BufferHealth::Poor,    // 5-15% buffered
+            16..=40 => BufferHealth::Good,   // 15-40% buffered
+            _ => BufferHealth::Excellent,    // >40% buffered
+        };
     }
 
-    pub fn update_playback_position(&self, byte_position: u64) {
-        self.playback_position
-            .store(byte_position, Ordering::SeqCst);
+    pub fn update_playback_position(&self, position: u64) {
+        self.playback_position.store(position, Ordering::SeqCst);
     }
 
+    /// Find the number of continuous bytes available from position 0
     pub fn get_available_bytes(&self) -> u64 {
-        self.layout
-            .load()
-            .last()
-            .map(|f| f.virtual_start + f.length)
-            .unwrap_or(0)
+        let fd = self.file.as_fd();
+
+        // Start from beginning and find first hole
+        match seek(fd, SeekFrom::Data(0)) {
+            Ok(data_start) => {
+                if data_start > 0 {
+                    return 0;
+                }
+
+                match seek(fd, SeekFrom::Hole(0)) {
+                    Ok(hole_start) => hole_start,
+                    Err(_) => self.total_size,
+                }
+            }
+            Err(_) => 0,
+        }
+    }
+
+    pub fn is_range_available(&self, start: u64, length: u64) -> bool {
+        let fd = self.file.as_fd();
+        let end = start + length;
+        let pos = start;
+
+        while pos < end {
+            match seek(fd, SeekFrom::Data(pos)) {
+                Ok(data_pos) => {
+                    if data_pos > pos {
+                        return false;
+                    }
+                    match seek(fd, SeekFrom::Hole(pos)) {
+                        Ok(hole_pos) => {
+                            if hole_pos < end {
+                                return false;
+                            }
+                            return true;
+                        }
+                        Err(_) => return true,
+                    }
+                }
+                Err(_) => return false,
+            }
+        }
+        true
     }
 
     pub async fn get_stream(
@@ -177,12 +174,31 @@ impl StreamOrchestrator {
         start: u64,
         length: u64,
         chunk_size: usize,
-    ) -> impl futures::Stream<Item = Result<Bytes, StreamError>> + 'static {
+    ) -> impl Stream<Item = Result<Bytes, StreamError>> + 'static {
         self.update_playback_position(start);
-        self.health_check();
-        self.update_layout();
+        let mmap = Arc::clone(&self.mmap);
+        let end = start + length;
 
-        let layout = self.layout.load_full();
-        read_range_with_chunk_size(start, length, chunk_size, layout.to_vec())
+        async_stream::try_stream! {
+            let mut pos = start;
+
+            while pos < end {
+                let chunk_end = (pos + chunk_size as u64).min(end);
+                let chunk_len = (chunk_end - pos) as usize;
+
+                // Wait for data to be available
+                // In production, you'd want to check if range is available
+                // and potentially wait/retry if not
+
+                let chunk = {
+                    let start_idx = pos as usize;
+                    let end_idx = start_idx + chunk_len;
+                    Bytes::copy_from_slice(&mmap.read()[start_idx..end_idx])
+                };
+
+                yield chunk;
+                pos += chunk_len as u64;
+            }
+        }
     }
 }

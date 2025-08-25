@@ -66,17 +66,17 @@ pub async fn analyse_rar_buffer(
                 data_length = pack_size;
 
                 // For first volume, find MKV signature
-                if is_first {
-                    let mut search_buf = vec![0u8; 1024.min(pack_size as usize)];
-                    let current_pos = data_offset;
-                    cursor.read_exact(&mut search_buf).await?;
+                // if is_first {
+                //     let mut search_buf = vec![0u8; 1024.min(pack_size as usize)];
+                //     let current_pos = data_offset;
+                //     cursor.read_exact(&mut search_buf).await?;
 
-                    if let Some(mkv_offset) = search_buf.windows(4).position(|w| w == MKV_SIGNATURE)
-                    {
-                        data_offset = current_pos + mkv_offset as u64;
-                        data_length = pack_size - mkv_offset as u64;
-                    }
-                }
+                //     if let Some(mkv_offset) = search_buf.windows(4).position(|w| w == MKV_SIGNATURE)
+                //     {
+                //         data_offset = current_pos + mkv_offset as u64;
+                //         data_length = pack_size - mkv_offset as u64;
+                //     }
+                // }
 
                 break;
             }
