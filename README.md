@@ -2,6 +2,9 @@
 
 Stream video files directly from Usenet NZBs without downloading the entire file first.
 
+This is still VERY much a work in progress. Prototype is working and can stream
+video, but there's a decent chunk of refactoring to do.
+
 ## Features
 
 - 🎬 Stream video while downloading
@@ -27,4 +30,8 @@ Stream video files directly from Usenet NZBs without downloading the entire file
 
 ## TODO
 
-- mkv streaming only works for the first segment, maybe we need to remux
+- migrate fully over to sparse files
+- tweak batch generator, iterated over the architecture a few times but batching
+  still seems like the right choice despite minor worker waste
+- CI failing because upstream fix for `rek2_nntp` hasn't been accepted yet,
+  switch over to fork?
