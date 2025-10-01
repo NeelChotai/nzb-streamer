@@ -22,7 +22,7 @@ pub enum BufferHealth {
 }
 
 impl BufferHealth {
-    /// How many parts to process concurrently
+    /// how many parts to process concurrently
     pub fn concurrent_jobs(&self, total_jobs: usize) -> usize {
         match self {
             Self::Critical => 1,
@@ -111,10 +111,10 @@ impl StreamOrchestrator {
         };
 
         let health = match buffer_percentage {
-            0..=5 => BufferHealth::Critical, // <5% buffered
-            6..=15 => BufferHealth::Poor,    // 5-15% buffered
-            16..=40 => BufferHealth::Good,   // 15-40% buffered
-            _ => BufferHealth::Excellent,    // >40% buffered
+            0..=5 => BufferHealth::Critical,
+            6..=15 => BufferHealth::Poor,
+            16..=35 => BufferHealth::Good,
+            _ => BufferHealth::Excellent,
         };
     }
 
@@ -186,9 +186,8 @@ impl StreamOrchestrator {
                 let chunk_end = (pos + chunk_size as u64).min(end);
                 let chunk_len = (chunk_end - pos) as usize;
 
-                // Wait for data to be available
-                // In production, you'd want to check if range is available
-                // and potentially wait/retry if not
+                // wait for data to be available
+                // TODO: check if range is available and wait/retry if not
 
                 let chunk = {
                     let start_idx = pos as usize;
